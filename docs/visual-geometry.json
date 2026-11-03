@@ -1,0 +1,93 @@
+{
+  "ui-welcome.png": {
+    "window": [
+      1440,
+      940
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      476,
+      861,
+      768,
+      44
+    ]
+  },
+  "ui-conversation.png": {
+    "window": [
+      1440,
+      940
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      476,
+      862,
+      768,
+      44
+    ]
+  },
+  "ui-chat-october-scale.png": {
+    "window": [
+      1534,
+      862
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      523,
+      780,
+      768,
+      44
+    ]
+  },
+  "ui-chat-rich-narrow.png": {
+    "window": [
+      980,
+      720
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      312,
+      638,
+      636,
+      44
+    ]
+  },
+  "ui-code-rich-narrow.png": {
+    "window": [
+      980,
+      720
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      312,
+      642,
+      636,
+      44
+    ]
+  },
+  "ui-narrow.png": {
+    "window": [
+      980,
+      720
+    ],
+    "sidebar_width": 280,
+    "prompt": [
+      312,
+      641,
+      636,
+      44
+    ]
+  },
+  "ui-sidebar-hidden.png": {
+    "window": [
+      980,
+      720
+    ],
+    "sidebar_width": 0,
+    "prompt": [
+      106,
+      641,
+      768,
+      44
+    ]
+  }
+}

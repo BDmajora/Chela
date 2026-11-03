@@ -1,0 +1,34 @@
+name: C desktop checks
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config python3 openssh-client imagemagick \
+            libjson-c-dev libcurl4-openssl-dev libsqlite3-dev libwayland-dev wayland-protocols \
+            libxkbcommon-dev libcairo2-dev libfontconfig-dev libfreetype-dev \
+            libgtk-3-dev qt6-base-dev xvfb
+      - run: make -j2 all backends
+      - name: No toolkit or GLib in the native build
+        run: "! ldd build/chela | grep -E 'gtk|glib|gobject|pango|Qt'"
+      # Unit, integration, keyring and every desktop test; the desktop runs headless.
+      - run: make check
+      - name: Toolkit hosts start and keep running
+        run: |
+          export HOME=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d) XDG_DATA_HOME=$(mktemp -d)
+          QT_QPA_PLATFORM=offscreen timeout 5 build/chela --backend=qt || test $? -eq 124
+          xvfb-run -a sh -c 'timeout 5 build/chela --backend=gtk || test $? -eq 124'
+      - run: make sanitize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-test-evidence
+          path: |
+            build/ui-*.png
+            build/*.log
+            build/visual-geometry.json

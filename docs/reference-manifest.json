@@ -1,0 +1,17 @@
+{
+  "chat": {
+    "source": "https://github.com/anthropics/claude-code/issues/104695",
+    "image": "https://github.com/user-attachments/assets/f9392145-9c53-4ad5-a3ce-de2daff0a4d4",
+    "sha256": "9a7fb0041d9a793880d045a3f029679ed94f5d95bf8d2776fb117e4701f21801"
+  },
+  "settings": {
+    "source": "https://github.com/anthropics/claude-code/issues/104695",
+    "image": "https://github.com/user-attachments/assets/3c6ef8c1-aa22-4f1a-9d4e-a0c6c0ad1432",
+    "sha256": "361c9d5fabf8537116cf6f5d243799e8651947793a7dd51e40c4ff66ecef2654"
+  },
+  "organizer": {
+    "source": "https://github.com/anthropics/claude-code/issues/102118",
+    "image": "https://github.com/user-attachments/assets/cc7e426c-2082-4c04-8b23-d3b1af7b8b67",
+    "sha256": "abd95e427de85134f24be1b221feefbec8cf8202eb760eceb2dd46dd97b9c67e"
+  }
+}

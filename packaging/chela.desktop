@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Chela
+Comment=Local models, familiar coding workflow
+Exec=chela
+Icon=chela
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=chela

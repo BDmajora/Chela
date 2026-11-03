@@ -1,0 +1,10 @@
+build/
+.deps/
+*.o
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+/core
+/core.*
