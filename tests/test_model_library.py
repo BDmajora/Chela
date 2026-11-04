@@ -116,9 +116,129 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(args[args.index("--gpu-layers") + 1], "0")
         self.assertEqual(args[args.index("--fit") + 1], "off")
         self.assertNotIn("--cpu-moe", args)
-        for invalid in ({"context_size": 0}, {"memory_mode": 3}, {"gpu_headroom": -1}, {"device": "ROCm0\n--model"}):
+        # Mode 3 places each model in its preset section; command-line placement would override it there.
+        args = library.command({**config, "memory_mode": 3}, self.root)
+        for flag in ("--gpu-layers", "--fit", "--fit-target", "--cpu-moe"):
+            self.assertNotIn(flag, args)
+        self.assertEqual(args[args.index("--device") + 1], "Vulkan0")
+        for invalid in ({"context_size": 0}, {"memory_mode": 4}, {"gpu_headroom": -1}, {"device": "ROCm0\n--model"}):
             with self.assertRaisesRegex(RuntimeError, "Invalid memory settings"):
                 library.command({**config, **invalid}, self.root)
+
+    def gguf_with(self, name, architecture, before=(), tensors=()):
+        """A GGUF v3 header with optional metadata ahead of general.architecture, and tensors (name, shape, type, offset)."""
+        import struct
+        def string(text):
+            data = text.encode()
+            return struct.pack("<Q", len(data)) + data
+        entries = list(before) + [("general.architecture", 8, string(architecture))]
+        body = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), len(entries))
+        for key, kind, value in entries:
+            body += string(key) + struct.pack("<I", kind) + value
+        for tensor, shape, kind, offset in tensors:
+            body += string(tensor) + struct.pack("<I", len(shape)) + struct.pack(f"<{len(shape)}Q", *shape)
+            body += struct.pack("<IQ", kind, offset)
+        path = self.models / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+        return path
+
+    def test_gguf_architecture(self):
+        import struct
+        array = struct.pack("<IQ", 8, 2) + struct.pack("<Q", 1) + b"a" + struct.pack("<Q", 2) + b"bc"
+        plain = self.gguf_with("plain.gguf", "qwen4exp")
+        later = self.gguf_with("later.gguf", "deepseek41", [("general.name", 8, struct.pack("<Q", 3) + b"abc"),
+                                                            ("x.count", 4, struct.pack("<I", 7)), ("x.list", 9, array),
+                                                            ("x.floats", 9, struct.pack("<IQ", 6, 3) + bytes(12))])
+        self.assertEqual(library.gguf_architecture(plain), "qwen4exp")
+        self.assertEqual(library.gguf_architecture(later), "deepseek41")
+        self.assertEqual(library.gguf_architecture(self.gguf("bare.gguf")), "")
+        (self.models / "text.gguf").write_text("not a model")
+        self.assertEqual(library.gguf_architecture(self.models / "text.gguf"), "")
+        self.assertEqual(library.gguf_architecture(self.models / "missing.gguf"), "")
+
+    def test_gguf_experts(self):
+        import struct
+        # IQ2_S up, IQ4_NL and Q2_0 down, at an alignment of 64
+        path = self.gguf_with("experts.gguf", "qwen4exp", [("general.alignment", 4, struct.pack("<I", 64))], [
+            ("blk.0.ffn_up_exps.weight", (2560, 640, 256), 22, 0),
+            ("blk.0.ffn_down_exps.weight", (640, 2560, 256), 20, 1000),
+            ("blk.1.ffn_down_exps.weight", (640, 2560, 256), 42, 2000),
+            ("blk.0.attn_q.weight", (2560, 2560), 20, 3000)])
+        experts = library.gguf_experts(path)
+        size = path.stat().st_size
+        data = -(-size // 64) * 64
+        self.assertEqual(experts, [("blk.0.ffn_up_exps.weight", 256, 524800, data),
+                                   ("blk.0.ffn_down_exps.weight", 256, 921600, data + 1000),
+                                   ("blk.1.ffn_down_exps.weight", 256, 460800, data + 2000)])
+        unknown = self.gguf_with("unknown.gguf", "qwen4exp", (), [("blk.0.ffn_up_exps.weight", (2560, 640, 256), 99, 0)])
+        with self.assertRaisesRegex(ValueError, "unsupported expert tensor"):
+            library.gguf_experts(unknown)
+
+    def test_expert_cache_mode_places_each_model(self):
+        roles = [(f"blk.0.ffn_{role}_exps.weight", (256, 256, 2), 8, offset) for role, offset in (("up", 0), ("gate", 100000))]
+        self.gguf_with("qwen/Flash-Next-IQ1_M-00001-of-00002.gguf", "qwen4exp", (), roles)
+        self.gguf_with("qwen/Flash-Next-IQ1_M-00002-of-00002.gguf", "qwen4exp", (),
+                       [("blk.0.ffn_down_exps.weight", (256, 256, 2), 8, 0)])
+        self.gguf_with("gemma/Gemma-Q4_K.gguf", "gemma3")
+        self.gguf_with("bare/Flash-Next-Dense.gguf", "qwen4exp")
+        data = self.root / "data"
+        config = {"model_dir": str(self.models), "memory_mode": 3, "gpu_headroom": 1536}
+        with patch.object(Path, "home", return_value=self.root):
+            models, _ = library.prepare(config, data)
+        sections = {}
+        for block in (data / "models.ini").read_text().split("\n\n"):
+            lines = block.strip().splitlines()
+            if lines:
+                sections[lines[0]] = dict(line.split(" = ", 1) for line in lines[1:])
+        flash = next(v for k, v in sections.items() if "IQ1_M" in k)
+        gemma = next(v for k, v in sections.items() if "Gemma" in k)
+        dense = next(v for k, v in sections.items() if "Dense" in k)
+        sources = json.loads(flash["ssd-expert-source"])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0], str(Path(flash["model"]).parent / "experts.tsv"))
+        rows = [line.split("\t") for line in Path(sources[0]).read_text().splitlines()]
+        self.assertEqual(rows[0], ["tensor", "expert_idx", "nbytes", "source_path", "offset"])
+        # two experts of each of three roles: 8 blocks of 34 bytes a row, 256 rows
+        self.assertEqual(len(rows), 7)
+        self.assertEqual({row[2] for row in rows[1:]}, {str(8 * 34 * 256)})
+        self.assertTrue(all(Path(row[3]).is_symlink() for row in rows[1:]))
+        up = [row for row in rows[1:] if "_up_" in row[0]]
+        self.assertEqual(int(up[1][4]) - int(up[0][4]), 8 * 34 * 256)
+        self.assertEqual({row[3] for row in rows[1:] if "_down_" in row[0]},
+                         {str(Path(flash["model"]).with_name("model-00002-of-00002.gguf"))})
+        self.assertEqual(flash["ssd-vram-budget"], "auto")
+        self.assertEqual(flash["ssd-vram-reserve-mib"], "1536")
+        self.assertEqual((flash["gpu-layers"], flash["fit"], flash["mmap"], flash["repack"]), ("99", "off", "true", "false"))
+        self.assertEqual(flash["defer-experts"], "true")
+        trace = json.loads(flash["ssd-trace-file"])
+        self.assertEqual(len(trace), 1)
+        self.assertTrue(trace[0].startswith(str(data / "traces")) and trace[0].endswith(".trace"))
+        self.assertTrue((data / "traces").is_dir())
+        self.assertNotIn("ssd-expert-source", gemma)
+        self.assertEqual((gemma["gpu-layers"], gemma["fit"], gemma["fit-target"]), ("auto", "on", "1536"))
+        # a supported architecture without routed experts has nothing for the caches to read
+        self.assertNotIn("ssd-expert-source", dense)
+        self.assertEqual((dense["gpu-layers"], dense["fit"]), ("auto", "on"))
+        # the other modes keep their placement on the command line: sections hold only the model
+        with patch.object(Path, "home", return_value=self.root):
+            library.prepare({**config, "memory_mode": 0}, data)
+        self.assertNotIn("ssd-", (data / "models.ini").read_text())
+        self.assertNotIn("fit", (data / "models.ini").read_text())
+
+    def test_expert_cache_memory_limit(self):
+        meminfo = self.root / "meminfo"
+        meminfo.write_text("MemTotal:       65536000 kB\nMemFree:        1000 kB\n")
+        limits = library.memory_limits(meminfo)
+        total = 65536000 * 1024
+        self.assertIn(f"MemoryMax={total - total // 16}\n", limits)
+        self.assertIn("MemorySwapMax=0\n", limits)
+        meminfo.write_text("MemTotal:       4096000 kB\n")
+        with self.assertRaisesRegex(RuntimeError, "more than 6 GiB"):
+            library.memory_limits(meminfo)
+        meminfo.write_text("nothing here\n")
+        with self.assertRaisesRegex(RuntimeError, "MemTotal"):
+            library.memory_limits(meminfo)
 
     def test_gpu_detection_and_missing_gpu(self):
         result = subprocess.CompletedProcess([], 0, "Available devices:\n  ROCm0: AMD Radeon RX 6800 (16368 MiB, 15000 MiB free)\n  Vulkan0: AMD GPU (16368 MiB)\n", "")

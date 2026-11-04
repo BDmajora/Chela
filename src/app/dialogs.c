@@ -771,10 +771,10 @@ static void connections_page(App *a, Settings *s) {
         library_spin(a, "Server port", cu_id(cu, "lib-remote-port"), &s->remote_port, 1, 65535, 1, on);
         library_spin(a, "Local port", cu_id(cu, "lib-local-port"), &s->local_port, 1, 65535, 1, on);
         field_row(a, "Memory use");
-        const char *modes[] = {"Automatic GPU + RAM", "MoE experts in RAM", "CPU / RAM only"};
+        const char *modes[] = {"Automatic GPU + RAM", "MoE experts in RAM", "CPU / RAM only", "InferSSD expert cache"};
         cu_open(cu, cu_id(cu, "lib-memory-field"), &(CuBox){.w = CU_GROW,
-            .tooltip = "Automatic fits weights to GPU memory and keeps the rest in RAM. MoE experts in RAM keeps expert calculations on the CPU. CPU / RAM only works without a GPU."});
-        ui_dropdown(a, cu_id(cu, "lib-memory"), modes, 3, &s->memory, on, false);
+            .tooltip = "Automatic fits weights to GPU memory and keeps the rest in RAM. MoE experts in RAM keeps expert calculations on the CPU. CPU / RAM only works without a GPU. InferSSD expert cache runs Qwen3.8-Flash-Next, DeepSeek-V4.1 and Muse through InferSSD's RAM and GPU expert caches (other models load as Automatic); it needs a server built with the expert tier."});
+        ui_dropdown(a, cu_id(cu, "lib-memory"), modes, 4, &s->memory, on, false);
         cu_close(cu);
         field_end(a);
         cu_open(cu, cu_id(cu, "lib-device-field"), &(CuBox){.w = CU_GROW,

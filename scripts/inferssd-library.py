@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,18 @@ import urllib.request
 
 SERVICE = "chela-inferssd.service"
 SPLIT = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+# Architectures InferSSD's expert executor runs (engine/src/ssd/model-adapter.cpp). In memory mode 3 these models
+# load through its RAM and GPU expert caches; every other model loads as in mode 0.
+SSD_ARCHITECTURES = ("qwen4exp", "deepseek41", "muse-spark")
+# GGUF metadata value sizes by type: u8 i8 u16 i16 u32 i32 f32 bool _ _ u64 i64 f64 (8 string, 9 array).
+GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+# The routed experts' tensors, and ggml's tensor types: values and bytes of a block (ggml_type_traits).
+EXPERT_TENSOR = re.compile(r"blk\.\d+\.ffn_(up|gate|down)_exps\.weight")
+GGML_BLOCKS = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 9: (32, 40),
+               10: (256, 84), 11: (256, 110), 12: (256, 144), 13: (256, 176), 14: (256, 210), 15: (256, 292),
+               16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50), 20: (32, 18), 21: (256, 110),
+               22: (256, 82), 23: (256, 136), 29: (256, 56), 30: (1, 2), 34: (256, 54), 35: (256, 66),
+               39: (32, 17), 40: (64, 36), 41: (128, 18), 42: (64, 18)}
 
 
 def locations():
@@ -85,17 +98,124 @@ def discover(roots):
     return sorted(models, key=lambda m: m["id"].lower()), skipped
 
 
+def gguf_skip(stream, kind, depth=0):
+    if kind in GGUF_SIZES:
+        stream.seek(GGUF_SIZES[kind], os.SEEK_CUR)
+    elif kind == 8:
+        stream.seek(struct.unpack("<Q", stream.read(8))[0], os.SEEK_CUR)
+    elif kind == 9 and depth == 0:
+        inner, count = struct.unpack("<IQ", stream.read(12))
+        if inner in GGUF_SIZES:
+            stream.seek(GGUF_SIZES[inner] * count, os.SEEK_CUR)
+        else:
+            for _ in range(min(count, 1 << 20)):
+                gguf_skip(stream, inner, 1)
+    else:
+        raise ValueError("unsupported GGUF metadata type")
+
+
+def gguf_architecture(path):
+    """general.architecture of a GGUF file, or "" when it cannot be read; only the metadata before it is read."""
+    try:
+        with open(path, "rb") as stream:
+            magic, version, _tensors, count = struct.unpack("<4sIQQ", stream.read(24))
+            if magic != b"GGUF" or version not in (2, 3):
+                return ""
+            for _ in range(min(count, 65536)):
+                size = struct.unpack("<Q", stream.read(8))[0]
+                if size > 65536:
+                    return ""
+                key = stream.read(size)
+                kind = struct.unpack("<I", stream.read(4))[0]
+                if key == b"general.architecture" and kind == 8:
+                    size = struct.unpack("<Q", stream.read(8))[0]
+                    return stream.read(size).decode("utf-8") if size <= 256 else ""
+                gguf_skip(stream, kind)
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        pass
+    return ""
+
+
+def gguf_experts(path):
+    """The routed expert tensors of one GGUF file, from its header: (name, experts, bytes of an expert, file offset)."""
+    with open(path, "rb") as stream:
+        magic, version, tensors, count = struct.unpack("<4sIQQ", stream.read(24))
+        if magic != b"GGUF" or version not in (2, 3):
+            raise ValueError("not a GGUF file")
+        alignment = 32
+        for _ in range(count):
+            key = stream.read(struct.unpack("<Q", stream.read(8))[0])
+            kind = struct.unpack("<I", stream.read(4))[0]
+            if key == b"general.alignment" and kind == 4:
+                alignment = struct.unpack("<I", stream.read(4))[0]
+            else:
+                gguf_skip(stream, kind)
+        found = []
+        for _ in range(tensors):
+            name = stream.read(struct.unpack("<Q", stream.read(8))[0]).decode("utf-8")
+            dimensions = struct.unpack("<I", stream.read(4))[0]
+            shape = struct.unpack(f"<{dimensions}Q", stream.read(8 * dimensions))
+            kind, offset = struct.unpack("<IQ", stream.read(12))
+            if EXPERT_TENSOR.fullmatch(name):
+                if dimensions != 3 or kind not in GGML_BLOCKS or shape[0] % GGML_BLOCKS[kind][0]:
+                    raise ValueError(f"unsupported expert tensor {name}")
+                values, block = GGML_BLOCKS[kind]
+                found.append((name, shape[2], shape[0] // values * block * shape[1], offset))
+        data = -(-stream.tell() // alignment) * alignment
+    return [(name, experts, bytes_, data + offset) for name, experts, bytes_, offset in found]
+
+
+def write_expert_index(path, links):
+    """The alias index InferSSD's expert caches read a GGUF's experts by: each expert role's file range, with no weight
+    copied. True when the model has routed experts."""
+    rows = ["tensor\texpert_idx\tnbytes\tsource_path\toffset"]
+    for link in links:
+        for name, experts, expert_bytes, offset in gguf_experts(link):
+            rows += [f"{name}\t{i}\t{expert_bytes}\t{link}\t{offset + i * expert_bytes}" for i in range(experts)]
+    if len(rows) == 1:
+        return False
+    atomic_write(path, "\n".join(rows) + "\n")
+    return True
+
+
+def model_options(config, data, model, links):
+    """Per-model preset options. Router mode gives command-line options precedence over a model's section, so in mode 3
+    the placement options live here: InferSSD's expert caches for a supported architecture, fit for the rest."""
+    if config.get("memory_mode", 0) != 3:
+        return []
+    index = links[0].parent / "experts.tsv"
+    try:
+        routed = gguf_architecture(links[0]) in SSD_ARCHITECTURES and write_expert_index(index, links)
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        routed = False
+    if not routed:
+        return ["gpu-layers = auto", "fit = on", f"fit-target = {config.get('gpu_headroom', 1024)}"]
+    traces = data / "traces"
+    traces.mkdir(exist_ok=True, mode=0o700)
+    return [
+        "ssd-expert-source = " + json.dumps([str(index)]),
+        "ssd-vram-budget = auto",
+        # The tier grows until only this is left, and a long prompt's scratch comes out of it.
+        f"ssd-vram-reserve-mib = {config.get('gpu_headroom', 1024)}",
+        # The expert predictor's traces and usage profile, kept for this model across restarts.
+        "ssd-trace-file = " + json.dumps([str(traces / (model["id"] + ".trace"))]),
+        # The sink reads the experts: mapped, their pages stay unread.
+        "gpu-layers = 99", "fit = off", "mmap = true", "repack = false", "defer-experts = true",
+    ]
+
+
 def prepare(config, data):
     roots = [config["model_dir"], "~/.local/share/inferssd/models", "~/.cache/llama.cpp", "~/.cache/huggingface/hub"]
     models, skipped = discover(roots)
     if not models:
         raise RuntimeError(f"No complete GGUF models found in {config['model_dir']} or the model caches. Download a GGUF first, or change Model folder.")
-    if any(c in str(data) for c in "\r\n#;"):
+    if any(c in str(data) for c in "\r\n\t#;"):
         raise RuntimeError("The home/data folder contains characters unsupported by InferSSD presets.")
     preset = ["[*]", "load-on-startup = false", ""]
     for model in models:
         folder = data / "models" / model["id"]
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        links = []
         for i, part in enumerate(model["parts"], 1):
             name = "model.gguf" if len(model["parts"]) == 1 else f"model-{i:05d}-of-{len(model['parts']):05d}.gguf"
             link = folder / name
@@ -104,8 +224,8 @@ def prepare(config, data):
             elif link.exists():
                 raise RuntimeError(f"Expected a managed symlink at {link}; no model file was overwritten.")
             link.symlink_to(part.absolute())
-            if i == 1:
-                preset += [f"[{model['id']}]", f"model = {link}", ""]
+            links.append(link)
+        preset += [f"[{model['id']}]", f"model = {links[0]}", *model_options(config, data, model, links), ""]
     atomic_write(data / "models.ini", "\n".join(preset))
     (data / "cache").mkdir(exist_ok=True, mode=0o700)
     return models, skipped
@@ -116,15 +236,19 @@ def command(config, data):
     context = config.get("context_size", 8192)
     headroom = config.get("gpu_headroom", 1024)
     device = config.get("device", "ROCm0")  # Preserve older installed configurations.
-    if (type(mode) is not int or mode not in (0, 1, 2) or type(context) is not int or
+    if (type(mode) is not int or mode not in (0, 1, 2, 3) or type(context) is not int or
             not 512 <= context <= 131072 or type(headroom) is not int or not 256 <= headroom <= 65536 or
             not isinstance(device, str) or not re.fullmatch(r"[A-Za-z0-9_,-]+", device)):
         raise RuntimeError("Invalid memory settings. Reconnect using Model library setup.")
+    # Mode 3 places each model in its preset section (model_options): options given here would override it.
+    placement = [] if mode == 3 else ["--gpu-layers", "0" if mode == 2 else "auto", "--fit", "off" if mode == 2 else "on",
+                                      "--fit-target", str(headroom)]
     args = [config["server"], "--models-preset", str(data / "models.ini"),
             "--models-max", "1", "--models-autoload", "--device", "none" if mode == 2 else device,
-            "--gpu-layers", "0" if mode == 2 else "auto", "--fit", "off" if mode == 2 else "on",
-            "--fit-target", str(headroom), "--ctx-size", str(context),
-            "--batch-size", "512", "--ubatch-size", "128",
+            *placement, "--ctx-size", str(context),
+            # Experts kept in RAM are copied to the GPU once per micro-batch during prompt processing,
+            # so 1024-token micro-batches prefill about 5x faster than 128 at a small VRAM cost.
+            "--batch-size", "2048", "--ubatch-size", "1024",
             "--parallel", "1", "--jinja", "--host", "127.0.0.1", "--port", str(config["port"])]
     if mode == 1:
         args.append("--cpu-moe")
@@ -403,6 +527,19 @@ def unit_quote(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def memory_limits(meminfo=Path("/proc/meminfo")):
+    """The service's memory limit for InferSSD's expert caches: they size themselves within a finite cgroup and
+    require swap off for it. The limit leaves the desktop 1/16 of RAM, at least 2 GiB."""
+    match = re.search(r"^MemTotal:\s+(\d+) kB", meminfo.read_text(), re.M)
+    if not match:
+        raise RuntimeError("Cannot read MemTotal for the expert cache memory limit.")
+    total = int(match[1]) * 1024
+    limit = total - max(2 << 30, total // 16)
+    if limit < 4 << 30:
+        raise RuntimeError("The InferSSD expert cache needs more than 6 GiB of RAM on the inference computer.")
+    return f"MemoryMax={limit}\nMemorySwapMax=0\n"
+
+
 def install(args):
     config_dir, data = locations()
     binary = Path(args.server).expanduser().resolve()
@@ -417,10 +554,13 @@ def install(args):
         required.append("--list-devices")
     if args.memory_mode == 1:
         required.append("--cpu-moe")
+    if args.memory_mode == 3:
+        required += ["--ssd-expert-source", "--ssd-vram-budget", "--ssd-trace-file", "--defer-experts"]
     if result.returncode or not all(flag in help_text for flag in required):
         missing = ", ".join(flag for flag in required if flag not in help_text)
         raise RuntimeError("This InferSSD binary lacks required router, memory, or thinking options "
-                           f"({missing or 'help command failed'}). Rebuild your server before setup.")
+                           f"({missing or 'help command failed'}). Rebuild your server before setup"
+                           f"{' with the expert tier (cmake preset linux-rocm or linux-cuda)' if args.memory_mode == 3 else ''}.")
     config = {"server": str(binary), "model_dir": str(Path(args.model_dir).expanduser().absolute()),
               "port": args.port, "memory_mode": args.memory_mode, "context_size": args.context_size,
               "gpu_headroom": args.gpu_headroom, "device": "none" if args.memory_mode == 2 else args.device}
@@ -461,6 +601,7 @@ def install(args):
                f"Environment={unit_quote('XDG_CONFIG_HOME=' + str(config_dir.parent))}\n"
                f"Environment={unit_quote('XDG_DATA_HOME=' + str(data.parent.parent))}\n"
                f"ExecStart={unit_quote(sys.executable)} {unit_quote(helper)} --serve\n"
+               f"{memory_limits() if args.memory_mode == 3 else ''}"
                "Restart=on-failure\nRestartSec=5\nTimeoutStopSec=60\nKillMode=control-group\n\n"
                "[Install]\nWantedBy=default.target\n")
     atomic_write(unit, service)
@@ -495,8 +636,9 @@ def main():
     parser.add_argument("--server", default="~/inferssd/build-rocm/bin/inferssd-server")
     parser.add_argument("--model-dir", default="~/models")
     parser.add_argument("--port", type=int, default=8088)
-    parser.add_argument("--memory-mode", type=int, choices=(0, 1, 2), default=0,
-                        help="0: automatic GPU + RAM, 1: MoE experts in RAM, 2: CPU only")
+    parser.add_argument("--memory-mode", type=int, choices=(0, 1, 2, 3), default=0,
+                        help="0: automatic GPU + RAM, 1: MoE experts in RAM, 2: CPU only, "
+                             "3: InferSSD expert caches for supported MoE models (others as 0)")
     parser.add_argument("--context-size", type=int, default=8192)
     parser.add_argument("--gpu-headroom", type=int, default=1024, help="GPU memory reserve in MiB")
     parser.add_argument("--device", default="auto")

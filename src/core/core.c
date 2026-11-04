@@ -185,7 +185,7 @@ char *ch_connection_url(const ChConfig *c, ChError **error) {
     return url;
 }
 bool ch_config_validate(const ChConfig *c, ChError **error) {
-    if (c->thinking < CH_THINK_DEFAULT || c->thinking > CH_THINK_DEEP || c->memory_mode < 0 || c->memory_mode > 2 ||
+    if (c->thinking < CH_THINK_DEFAULT || c->thinking > CH_THINK_DEEP || c->memory_mode < 0 || c->memory_mode > 3 ||
         c->context_size < 512 || c->context_size > 131072 || c->gpu_headroom < 256 || c->gpu_headroom > 65536 ||
         !*c->gpu_device ||
         strspn(c->gpu_device, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_,-") !=
