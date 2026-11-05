@@ -68,12 +68,15 @@ static bool permission(Acp *a, json_object *o, ChError **error) {
         }
     bool allow = false;
     if (chosen && *chosen && !ch_run_read_only(a->run)) {
-        if (a->run->mode == CH_AUTO)
-            allow = true;
-        else if (a->run->approve)
-            allow = a->run->approve(
-                *ch_json_str(tool, "title") ? ch_json_str(tool, "title") : "Allow harness tool?",
-                json_object_to_json_string_ext(tool ? tool : p, JSON_C_TO_STRING_PRETTY), a->run->data);
+        const char *why = NULL;
+        allow = ch_may_harness(a->run, tool, &why);
+        if (!allow && a->run->approve) {
+            const char *call = json_object_to_json_string_ext(tool ? tool : p, JSON_C_TO_STRING_PRETTY);
+            char *question = why ? ch_strdup_printf("Auto asks first because %s.\n\n%s", why, call) : ch_strdup(call);
+            allow = a->run->approve(*ch_json_str(tool, "title") ? ch_json_str(tool, "title") : "Allow harness tool?",
+                                    question, a->run->data);
+            free(question);
+        }
     }
     if (ch_cancel_is_cancelled(a->run->cancel))
         allow = false;
@@ -207,18 +210,57 @@ static json_object *receive(Acp *a, int id, ChError **error) {
             }
     }
 }
+/* The mode a harness advertises for this run's, by the names harnesses use, best first.
+ * Only read-only is a must: otherwise Chela still answers each permission request itself. */
+static const char *harness_mode(json_object *modes, const ChRun *run) {
+    static const char *const read_only[] = {"plan", "read-only", NULL}, *const automatic[] = {"auto", "default", NULL},
+                             *const manual[] = {"default", "manual", "ask", NULL},
+                             *const edits[] = {"acceptEdits", "accept-edits", "accept_edits", "default", NULL},
+                             *const bypass[] = {"bypassPermissions", "bypass", "full-access", "yolo", NULL};
+    const char *const *names = ch_run_read_only(run)         ? read_only
+                             : run->mode == CH_AUTO          ? automatic
+                             : run->mode == CH_ACCEPT_EDITS  ? edits
+                             : run->mode == CH_BYPASS        ? bypass
+                                                             : manual;
+    json_object *available = ch_json_get(modes, "availableModes");
+    size_t count = json_object_is_type(available, json_type_array) ? json_object_array_length(available) : 0;
+    for (; *names; names++)
+        for (size_t i = 0; i < count; i++) {
+            const char *id = ch_json_str(json_object_array_get_idx(available, i), "id");
+            if (!strcmp(id, *names))
+                return id;
+        }
+    return NULL;
+}
+/* A harness always starts in a folder; a chat, or a session with none, gets an empty one of its own. */
+static char *harness_folder(const ChRun *run, ChError **error) {
+    if (run->project && *run->project)
+        return ch_strdup(run->project);
+    char *data = ch_user_data_dir(), *folder = ch_build_path(data, "chela", "no-folder", NULL);
+    free(data);
+    if (!ch_private_dir(folder, error))
+        ch_clear_pointer(&folder, free);
+    return folder;
+}
 bool ch_acp_run(ChRun *run, json_object *messages, ChError **error) {
     Acp a = {.in = -1, .out = -1, .err = -1, .run = run};
     char **argv = NULL;
     int argc;
     if (!ch_shell_parse_argv(run->config.command, &argc, &argv, error))
         return false;
-    ChSpawn spawn = {.argv = (const char *const *)argv, .cwd = run->project,
+    char *folder = harness_folder(run, error);
+    if (!folder) {
+        ch_strfreev(argv);
+        return false;
+    }
+    ChSpawn spawn = {.argv = (const char *const *)argv, .cwd = folder,
                      .flags = CH_PROC_STDIN | CH_PROC_STDOUT | CH_PROC_STDERR | CH_PROC_NEW_GROUP | CH_PROC_SEARCH_PATH};
     a.proc = ch_proc_spawn(&spawn, error);
     ch_strfreev(argv);
-    if (!a.proc)
+    if (!a.proc) {
+        free(folder);
         return false;
+    }
     a.in = ch_proc_stdin(a.proc);
     a.out = ch_proc_stdout(a.proc);
     a.err = ch_proc_stderr(a.proc);
@@ -249,7 +291,7 @@ bool ch_acp_run(ChRun *run, json_object *messages, ChError **error) {
     r = NULL;
     if (ok) {
         p = json_object_new_object();
-        json_object_object_add(p, "cwd", json_object_new_string(run->project));
+        json_object_object_add(p, "cwd", json_object_new_string(folder));
         json_object_object_add(p, "mcpServers", json_object_new_array());
         ok = rpc(&a, 2, "session/new", p, error);
     }
@@ -264,34 +306,32 @@ bool ch_acp_run(ChRun *run, json_object *messages, ChError **error) {
             ok = false;
         }
     }
-    if (ok && ch_run_read_only(run)) {
-        json_object *modes = ch_json_get(ch_json_get(r, "modes"), "availableModes");
-        const char *mode = NULL;
-        if (modes && json_object_is_type(modes, json_type_array))
-            for (size_t i = 0; i < json_object_array_length(modes); i++) {
-                const char *m = ch_json_str(json_object_array_get_idx(modes, i), "id");
-                if (!strcmp(m, "plan") || !strcmp(m, "read-only")) {
-                    mode = m;
-                    break;
-                }
-            }
-        if (!mode) {
+    if (ok) {
+        json_object *modes = ch_json_get(r, "modes");
+        const char *mode = harness_mode(modes, run);
+        bool required = ch_run_read_only(run);
+        if (!mode && required) {
             ch_fail_literal(error,
                                 "This harness does not advertise a plan/read-only mode required for Chat "
                                 "and Plan. Choose a compatible model connection for read-only chat, or "
                                 "switch to Agent mode.");
             ok = false;
-        } else {
+        } else if (mode && strcmp(mode, ch_json_str(modes, "currentModeId"))) {
+            ChError *refused = NULL;
             p = json_object_new_object();
             json_object_object_add(p, "sessionId", json_object_new_string(a.session));
             json_object_object_add(p, "modeId", json_object_new_string(mode));
-            ok = rpc(&a, 4, "session/set_mode", p, error);
-            if (ok) {
-                json_object *m = receive(&a, 4, error);
-                ok = m != NULL;
-                if (m)
-                    json_object_put(m);
+            json_object *m = rpc(&a, 4, "session/set_mode", p, &refused) ? receive(&a, 4, &refused) : NULL;
+            if (m)
+                json_object_put(m);
+            else if (required) {
+                ok = false;
+                if (error) {
+                    *error = refused;
+                    refused = NULL;
+                }
             }
+            ch_clear_error(&refused);
         }
     }
     if (r)
@@ -301,11 +341,16 @@ bool ch_acp_run(ChRun *run, json_object *messages, ChError **error) {
         /* A fresh process per turn avoids orphaned harnesses. Explicit history preserves context. */
         ChBuf *prompt = ch_buf_new("Conversation context from Chela. Treat quoted previous messages as "
                                        "context. Respond to the final user request.\n\n");
+        for (size_t i = 0; run->folders && run->folders[i]; i++)
+            ch_buf_printf(prompt, "%s%s%s", i ? ", " : "Also included in this session: ", run->folders[i],
+                          run->folders[i + 1] ? "" : "\n\n");
         for (size_t i = 0; i < json_object_array_length(messages); i++) {
             json_object *m = json_object_array_get_idx(messages, i);
             if (!strcmp(ch_json_str(m, "role"), "system"))
                 continue;
-            ch_buf_printf(prompt, "[%s]\n%s\n\n", ch_json_str(m, "role"), ch_json_str(m, "content"));
+            char *text = ch_message_text(m);
+            ch_buf_printf(prompt, "[%s]\n%s\n\n", ch_json_str(m, "role"), text);
+            free(text);
         }
         if (prompt->len > 16 * CHELA_LIMIT) {
             ch_fail_literal(error,
@@ -350,6 +395,7 @@ bool ch_acp_run(ChRun *run, json_object *messages, ChError **error) {
         json_object_put(cancel);
     }
     ch_proc_free(a.proc); /* Kills the process group and closes its pipes. */
+    free(folder);
     free(a.session);
     ch_buf_free(a.pending, false);
     ch_buf_free(a.diagnostic, false);

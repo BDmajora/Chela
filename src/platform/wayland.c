@@ -64,11 +64,22 @@ typedef struct Posted {
     void *data;
     struct Posted *next;
 } Posted;
+#define PASTE_LIMIT (64u * 1024u * 1024u)
+typedef struct {
+    struct wl_data_offer *offer;
+    char *mimes[32];
+    int count;
+} Offer;
+/* One transfer in progress: a paste of text, a paste of any data, or a drop. */
 typedef struct {
     int fd;
     ChBuf data;
-    void (*callback)(const char *, void *);
+    char *mime;
+    bool overflow;
+    void (*text_callback)(const char *, void *);
+    void (*data_callback)(const char *, const void *, size_t, void *);
     void *user;
+    Offer drop;
 } Paste;
 static struct {
     struct wl_display *display;
@@ -82,9 +93,10 @@ static struct {
     struct wl_keyboard *keyboard;
     struct wl_data_device_manager *data_manager;
     struct wl_data_device *data_device;
-    struct wl_data_offer *selection, *pending_offer;
-    bool selection_text, pending_text;
-    char *selection_mime, *pending_mime;
+    Offer selection, pending, drag;
+    uint32_t drag_serial;
+    struct wl_surface *drag_surface;
+    float drag_x, drag_y;
     struct wl_data_source *source;
     char *source_text;
     struct zxdg_decoration_manager_v1 *decorations;
@@ -695,18 +707,20 @@ static void ti_done(void *data, struct zwp_text_input_v3 *t, uint32_t serial) {
 static const struct zwp_text_input_v3_listener text_input_listener = {ti_enter, ti_leave, ti_preedit, ti_commit,
                                                                       ti_delete, ti_done};
 
-/* Clipboard */
+/* Clipboard and drag and drop: both arrive as data offers listing their MIME types. */
+static void offer_clear(Offer *o) {
+    if (o->offer)
+        wl_data_offer_destroy(o->offer);
+    for (int i = 0; i < o->count; i++)
+        free(o->mimes[i]);
+    memset(o, 0, sizeof(*o));
+}
 static void offer_mime(void *data, struct wl_data_offer *offer, const char *mime) {
     (void)data;
-    if (offer != wl.pending_offer)
-        return;
-    bool best = !strcmp(mime, "text/plain;charset=utf-8");
-    if (best || (!wl.pending_text && (!strcmp(mime, "text/plain") || !strcmp(mime, "UTF8_STRING") ||
-                                      !strcmp(mime, "TEXT") || !strcmp(mime, "STRING")))) {
-        wl.pending_text = true;
-        free(wl.pending_mime);
-        wl.pending_mime = ch_strdup(mime);
-    }
+    Offer *o = offer == wl.pending.offer ? &wl.pending : offer == wl.selection.offer ? &wl.selection
+             : offer == wl.drag.offer    ? &wl.drag     : NULL;
+    if (o && o->count < (int)CH_N_ELEMENTS(o->mimes))
+        o->mimes[o->count++] = ch_strdup(mime);
 }
 static void offer_source_actions(void *data, struct wl_data_offer *o, uint32_t a) {
     (void)data, (void)o, (void)a;
@@ -717,38 +731,89 @@ static void offer_action(void *data, struct wl_data_offer *o, uint32_t a) {
 static const struct wl_data_offer_listener offer_listener = {offer_mime, offer_source_actions, offer_action};
 static void device_offer(void *data, struct wl_data_device *d, struct wl_data_offer *offer) {
     (void)data, (void)d;
-    wl.pending_offer = offer;
-    wl.pending_text = false;
-    ch_clear_pointer(&wl.pending_mime, free);
+    offer_clear(&wl.pending);
+    wl.pending.offer = offer;
     wl_data_offer_add_listener(offer, &offer_listener, NULL);
+}
+static const char *offer_best(const Offer *o) {
+    int best = ch_clipboard_best((const char *const *)o->mimes, o->count);
+    return best >= 0 ? o->mimes[best] : NULL;
+}
+static void drag_event(bool inside) {
+    CuWindow *w = wl.window_count ? wl.windows[0] : NULL;
+    for (int i = 0; i < wl.window_count; i++)
+        if (wl.windows[i]->surface == wl.drag_surface)
+            w = wl.windows[i];
+    if (w)
+        send(w, (CuEvent){.type = CU_EV_DRAG, .focused = inside, .x = wl.drag_x, .y = wl.drag_y});
 }
 static void device_enter(void *data, struct wl_data_device *d, uint32_t serial, struct wl_surface *s, wl_fixed_t x,
                          wl_fixed_t y, struct wl_data_offer *offer) {
-    (void)data, (void)d, (void)serial, (void)s, (void)x, (void)y;
-    if (offer)
-        wl_data_offer_destroy(offer);
-    if (offer == wl.pending_offer)
-        wl.pending_offer = NULL;
+    (void)data, (void)d;
+    offer_clear(&wl.drag);
+    if (offer == wl.pending.offer) {
+        wl.drag = wl.pending;
+        memset(&wl.pending, 0, sizeof(wl.pending));
+    }
+    wl.drag_serial = serial;
+    wl.drag_surface = s;
+    wl.drag_x = (float)wl_fixed_to_double(x);
+    wl.drag_y = (float)wl_fixed_to_double(y);
+    const char *mime = offer_best(&wl.drag);
+    if (offer) {
+        wl_data_offer_accept(offer, serial, mime);
+        if (mime)
+            wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    }
+    if (mime)
+        drag_event(true);
 }
 static void device_leave(void *data, struct wl_data_device *d) {
     (void)data, (void)d;
+    if (offer_best(&wl.drag))
+        drag_event(false);
+    offer_clear(&wl.drag);
 }
 static void device_motion(void *data, struct wl_data_device *d, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
-    (void)data, (void)d, (void)t, (void)x, (void)y;
+    (void)data, (void)d, (void)t;
+    wl.drag_x = (float)wl_fixed_to_double(x);
+    wl.drag_y = (float)wl_fixed_to_double(y);
+    if (offer_best(&wl.drag))
+        drag_event(true);
+}
+static int paste_begin(struct wl_data_offer *offer, const char *mime) {
+    int fds[2];
+    if (wl.paste_count >= (int)CH_N_ELEMENTS(wl.pastes) || pipe2(fds, O_CLOEXEC | O_NONBLOCK))
+        return -1;
+    wl_data_offer_receive(offer, mime, fds[1]);
+    close(fds[1]);
+    wl_display_flush(wl.display);
+    int index = wl.paste_count++;
+    memset(&wl.pastes[index], 0, sizeof(Paste));
+    wl.pastes[index].fd = fds[0];
+    wl.pastes[index].mime = ch_strdup(mime);
+    ch_buf_init(&wl.pastes[index].data);
+    return index;
 }
 static void device_drop(void *data, struct wl_data_device *d) {
     (void)data, (void)d;
+    const char *mime = offer_best(&wl.drag);
+    int index = mime ? paste_begin(wl.drag.offer, mime) : -1;
+    if (index >= 0) {
+        /* The offer stays alive until its bytes have arrived. */
+        wl.pastes[index].drop = wl.drag;
+        memset(&wl.drag, 0, sizeof(wl.drag));
+    }
+    drag_event(false);
 }
 static void device_selection(void *data, struct wl_data_device *d, struct wl_data_offer *offer) {
     (void)data, (void)d;
-    if (wl.selection && wl.selection != offer)
-        wl_data_offer_destroy(wl.selection);
-    wl.selection = offer;
-    wl.selection_text = offer && offer == wl.pending_offer && wl.pending_text;
-    free(wl.selection_mime);
-    wl.selection_mime = wl.selection_text ? ch_strdup(wl.pending_mime) : NULL;
-    if (offer == wl.pending_offer)
-        wl.pending_offer = NULL;
+    offer_clear(&wl.selection);
+    if (offer && offer == wl.pending.offer) {
+        wl.selection = wl.pending;
+        memset(&wl.pending, 0, sizeof(wl.pending));
+    } else if (offer)
+        wl.selection.offer = offer;
 }
 static const struct wl_data_device_listener device_listener = {device_offer, device_enter, device_leave,
                                                                device_motion, device_drop, device_selection};
@@ -802,6 +867,18 @@ static void clipboard_set(CuWindow *w, const char *text) {
     wl.source = source;
     wl_data_device_set_selection(wl.data_device, source, wl.input_serial);
 }
+/* The best plain-text type on offer. */
+static const char *selection_text(void) {
+    const char *best = NULL;
+    for (int i = 0; i < wl.selection.count; i++) {
+        const char *mime = wl.selection.mimes[i];
+        if (!strcmp(mime, "text/plain;charset=utf-8"))
+            return mime;
+        if (!best && (!strcmp(mime, "text/plain") || !strcmp(mime, "UTF8_STRING") || !strcmp(mime, "TEXT") || !strcmp(mime, "STRING")))
+            best = mime;
+    }
+    return best;
+}
 static void clipboard_request(CuWindow *w, void (*callback)(const char *, void *), void *data) {
     (void)w;
     if (wl.source && wl.source_text) {
@@ -809,32 +886,40 @@ static void clipboard_request(CuWindow *w, void (*callback)(const char *, void *
         callback(wl.source_text, data);
         return;
     }
-    if (!wl.selection || !wl.selection_text || wl.paste_count >= (int)CH_N_ELEMENTS(wl.pastes)) {
+    const char *mime = wl.selection.offer ? selection_text() : NULL;
+    int index = mime ? paste_begin(wl.selection.offer, mime) : -1;
+    if (index < 0) {
         callback(NULL, data);
         return;
     }
-    int fds[2];
-    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK)) {
-        callback(NULL, data);
+    wl.pastes[index].text_callback = callback;
+    wl.pastes[index].user = data;
+}
+static void clipboard_request_data(CuWindow *w, void (*callback)(const char *, const void *, size_t, void *), void *data) {
+    (void)w;
+    if (wl.source && wl.source_text) {
+        callback("text/plain", wl.source_text, strlen(wl.source_text), data);
         return;
     }
-    wl_data_offer_receive(wl.selection, wl.selection_mime, fds[1]);
-    close(fds[1]);
-    wl_display_flush(wl.display);
-    Paste *p = &wl.pastes[wl.paste_count++];
-    p->fd = fds[0];
-    ch_buf_init(&p->data);
-    p->callback = callback;
-    p->user = data;
+    const char *mime = wl.selection.offer ? offer_best(&wl.selection) : NULL;
+    int index = mime ? paste_begin(wl.selection.offer, mime) : -1;
+    if (index < 0) {
+        callback(NULL, NULL, 0, data);
+        return;
+    }
+    wl.pastes[index].data_callback = callback;
+    wl.pastes[index].user = data;
 }
 static void paste_read(int index) {
     Paste *p = &wl.pastes[index];
-    char chunk[16384];
+    char chunk[65536];
     for (;;) {
         ssize_t n = read(p->fd, chunk, sizeof(chunk));
         if (n > 0) {
-            if (p->data.len < 16 * 1024 * 1024)
+            if (p->data.len < PASTE_LIMIT)
                 ch_buf_append_len(&p->data, chunk, (size_t)n);
+            else
+                p->overflow = true;
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EINTR))
@@ -845,9 +930,22 @@ static void paste_read(int index) {
     Paste done = *p;
     memmove(wl.pastes + index, wl.pastes + index + 1, sizeof(Paste) * (size_t)(wl.paste_count - index - 1));
     wl.paste_count--;
-    char *text = ch_utf8_make_valid(done.data.str, (ptrdiff_t)done.data.len);
-    done.callback(text, done.user);
-    free(text);
+    if (done.text_callback) {
+        char *text = ch_utf8_make_valid(done.data.str, (ptrdiff_t)done.data.len);
+        done.text_callback(text, done.user);
+        free(text);
+    } else if (done.data_callback) {
+        /* A partial image is worse than none. */
+        bool whole = !done.overflow && done.data.len;
+        done.data_callback(whole ? done.mime : NULL, whole ? done.data.str : NULL, whole ? done.data.len : 0, done.user);
+    } else if (done.drop.offer) {
+        wl_data_offer_finish(done.drop.offer);
+        offer_clear(&done.drop);
+        CuWindow *target = wl.window_count ? wl.windows[0] : NULL;
+        if (target && !done.overflow && done.data.len)
+            send(target, (CuEvent){.type = CU_EV_DROP, .mime = done.mime, .data = done.data.str, .size = done.data.len});
+    }
+    free(done.mime);
     ch_buf_clear(&done.data);
 }
 
@@ -1229,6 +1327,7 @@ const CuPlatform *cu_platform_wayland(void) {
         p.timer_remove = timer_remove;
         p.clipboard_set = clipboard_set;
         p.clipboard_request = clipboard_request;
+        p.clipboard_request_data = clipboard_request_data;
         cc_install(&p);
     }
     return &p;

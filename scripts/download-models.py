@@ -117,7 +117,20 @@ def support_file(file, folders):
             or leaf == "readme.md" or leaf.endswith(".safetensors.index.json")) and path.suffix.lower() not in {".py", ".pyc"}
 
 
-def select_files(files, format_, quant="Q8_0", gguf_glob=None, original_subdir=None):
+def vision_file(files, weights):
+    """The repository's vision file (mmproj), which llama.cpp servers need to read images. Publishers keep it beside the
+    weights or at the top of the repository; of several precisions, F16 is the most widely supported."""
+    folder = PurePosixPath(weights[0].name).parent
+    found = [f for f in files if "mmproj" in PurePosixPath(f.name).name.lower() and f.name.lower().endswith(".gguf")]
+    nearby = [f for f in found if PurePosixPath(f.name).parent in (folder, PurePosixPath("."))]
+    def rank(file):
+        precision = re.search(r"[-_.](f16|bf16|f32)$", PurePosixPath(file.name).stem.lower())
+        order = ("f16", "bf16", "f32")
+        return PurePosixPath(file.name).parent != folder, order.index(precision[1]) if precision else 3, file.name
+    return sorted(nearby, key=rank)[:1]
+
+
+def select_files(files, format_, quant="Q8_0", gguf_glob=None, original_subdir=None, vision=True):
     if format_ == "original":
         weights = [f for f in files if f.name.endswith(".safetensors")
                    and not PurePosixPath(f.name).name.lower().startswith(("optimizer", "adapter_"))]
@@ -143,7 +156,7 @@ def select_files(files, format_, quant="Q8_0", gguf_glob=None, original_subdir=N
     weights = []
     for file in files:
         leaf = PurePosixPath(file.name).name.lower()
-        if not leaf.endswith(".gguf") or leaf.startswith(("mmproj", "mtp", "imatrix")) or "imatrix" in leaf:
+        if not leaf.endswith(".gguf") or leaf.startswith("mtp") or "mmproj" in leaf or "imatrix" in leaf:
             continue
         matches = fnmatch.fnmatchcase(file.name, gguf_glob) if gguf_glob else bool(pattern.search(file.name))
         if matches:
@@ -153,7 +166,8 @@ def select_files(files, format_, quant="Q8_0", gguf_glob=None, original_subdir=N
     groups = check_shards(weights, SPLIT)
     if len(groups) != 1:
         raise ValueError("Multiple GGUF model sets matched; choose one with --gguf-glob: " + ", ".join(sorted(groups)))
-    return sorted(weights + [f for f in files if PurePosixPath(f.name).name.lower().startswith(("readme", "license"))], key=lambda f: f.name)
+    extras = [f for f in files if PurePosixPath(f.name).name.lower().startswith(("readme", "license"))]
+    return sorted(weights + extras + (vision_file(files, weights) if vision else []), key=lambda f: f.name)
 
 
 def output_path(folder, file):
@@ -225,6 +239,7 @@ def main(argv=None):
     parser.add_argument("--format", choices=("original", "gguf"), default="original")
     parser.add_argument("--quant", default="Q8_0", help="GGUF quantization, default Q8_0; never falls back to a smaller quant")
     parser.add_argument("--gguf-glob", help="Explicit GGUF model-set pattern; overrides --quant")
+    parser.add_argument("--no-vision", action="store_true", help="Skip the GGUF vision file (mmproj); the model then cannot read images")
     parser.add_argument("--original-subdir", help="Select a checkpoint folder if a repo contains several")
     parser.add_argument("--revision", default="main")
     parser.add_argument("--workers", type=int, choices=range(1, 9), default=2, metavar="1..8")
@@ -265,7 +280,7 @@ def main(argv=None):
             revision = info.sha
             if not revision or not re.fullmatch(r"[a-fA-F0-9]{40}", revision):
                 raise ValueError("Could not pin the repository revision")
-            files = select_files(inventory(info), args.format, args.quant, args.gguf_glob, args.original_subdir)
+            files = select_files(inventory(info), args.format, args.quant, args.gguf_glob, args.original_subdir, not args.no_vision)
             folder = base / repo.replace("/", "--")
             if folder.is_symlink():
                 raise ValueError("The model output folder is a symlink")

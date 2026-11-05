@@ -12,67 +12,71 @@ typedef struct {
     const char *name, *svg;
 } IconDef;
 static const IconDef icons[] = {
-    {"app-menu", "<path d='M3 4h14M3 10h10M3 16h7'/>"},
-    {"go-previous", "<path d='m12 4-6 6 6 6'/>"},
-    {"go-next", "<path d='m8 4 6 6-6 6'/>"},
-    {"clock", "<circle cx='10' cy='10' r='8'/><path d='M10 5v5l4 2'/>"},
-    {"artifacts", "<rect x='2' y='6' width='10' height='12' rx='2'/><path d='m7 6 1-4 10 2-2 12-4-1'/>"},
-    {"projects", "<path d='M4 2h12M2 6h16l-2 12H4z'/>"},
+    /* Window and navigation */
+    {"app-menu", "<path d='M3.5 5h13M3.5 10h10M3.5 15h7'/>"},
+    {"sidebar-show", "<rect x='2.5' y='4' width='15' height='12' rx='2.5'/><path d='M6 8v4'/>"},
+    {"panel-right", "<rect x='2.5' y='3.5' width='15' height='13' rx='2.5'/><path d='M5.5 7h5M5.5 10h5M5.5 13h3M13 3.5v13'/>"},
+    {"go-previous", "<path d='m12 5-5 5 5 5'/>"},
+    {"go-next", "<path d='m8 5 5 5-5 5'/>"},
+    {"go-up", "<path d='M10 16V4m-5 5 5-5 5 5'/>"},
+    {"chevron-down", "<path d='m6 8 4 4 4-4'/>"},
+    {"chevron-right", "<path d='m8 6 4 4-4 4'/>"},
+    {"chevron-up", "<path d='m6 12 4-4 4 4'/>"},
     {"window-close", "<path d='m5 5 10 10M5 15 15 5'/>"},
     {"window-minimize", "<path d='M5 10h10'/>"},
     {"window-maximize", "<rect x='5' y='5' width='10' height='10' rx='1'/>"},
     {"window-restore", "<rect x='4' y='7' width='9' height='9' rx='1'/><path d='M7 7V4h9v9h-3'/>"},
-    {"sun", "<circle cx='10' cy='10' r='4'/><path d='M10 1v2m0 14v2M1 10h2m14 0h2M3 3l2 2m10 10 2 2M3 17l2-2M15 5l2-2'/>"},
-    {"moon", "<path d='M17 12a7 7 0 0 1-9-9 8 8 0 1 0 9 9z'/>"},
-    {"pin", "<path d='m7 2 9 9-4 1-3 3-4-4 3-3zM7 13l-5 5'/>"},
-    {"share", "<path d='M10 13V2m-4 4 4-4 4 4M4 10H2v8h16v-8h-2'/>"},
-    {"speaker", "<path d='M2 7h4l4-4v14l-4-4H2zm11-1a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14'/>"},
-    {"thumb-up", "<path d='M7 9 10 2h2v6h5l-2 9H7zM2 9h3v8H2z'/>"},
-    {"thumb-down", "<path d='m7 11 3 7h2v-6h5l-2-9H7zM2 3h3v8H2z'/>"},
-    {"regenerate", "<path d='M17 8a7 7 0 1 0 0 6M17 3v5h-5'/>"},
-    {"edit-find", "<circle cx='8.5' cy='8.5' r='5.5'/><path d='m13 13 4.5 4.5'/>"},
-    {"sidebar-show", "<rect x='2.5' y='3.5' width='15' height='13' rx='2'/><path d='M8 3.5v13'/>"},
-    {"list-add", "<path d='M10 3v14M3 10h14'/>"},
-    {"view-more", "<path d='M4 10h.1m5.9 0h.1m5.9 0h.1' stroke-width='2.5'/>"},
-    {"user-available", "<path d='M7 3.5h7a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H9l-4 3v-3a3 3 0 0 1-3-3v-5a3 3 0 0 1 3-3z'/>"},
-    {"utilities-terminal", "<path d='m6.5 6-4 4 4 4m7-8 4 4-4 4M11.5 4l-3 12'/>"},
-    {"folder", "<path d='M2.5 6V4.5h5l2 2h8v9a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1zM2.5 8h15'/>"},
-    {"preferences-other", "<rect x='3' y='6.5' width='14' height='11' rx='1.5'/><path d='M7 6.5v-3h6v3M3 11h14M9 10v3h2v-3'/>"},
-    {"view-sort-descending", "<path d='M5 3v14m-3-3 3 3 3-3M11 5h7m-7 5h5m-5 5h3'/>"},
-    {"sliders", "<path d='M5 2v5m0 4v7M15 2v9m0 4v3'/><circle cx='5' cy='9' r='2'/><circle cx='15' cy='13' r='2'/>"},
-    {"microphone", "<rect x='7' y='2' width='6' height='10' rx='3'/><path d='M4 8v1a6 6 0 0 0 12 0V8m-6 7v3m-3 0h6'/>"},
-    {"waveform", "<path d='M2 8v4M6 4v12M10 2v16M14 5v10M18 8v4'/>"},
-    {"thinking", "<path d='M7 14c0-3-3-3-3-7a6 6 0 0 1 12 0c0 4-3 4-3 7M7 15h6M8 18h4M10 4v3m-2 3 2-3 2 3'/>"},
-    {"chevron-down", "<path d='m6 8 4 4 4-4'/>"},
-    {"chevron-right", "<path d='m8 6 4 4-4 4'/>"},
-    {"session-idle", "<circle cx='10' cy='10' r='4' stroke-dasharray='1.2 2.2'/>"},
-    {"camera", "<path d='M2 6h4l1.5-3h5L14 6h4v11H2z'/><circle cx='10' cy='11' r='3'/>"},
-    {"skills", "<path d='M4 3h12v11H8v4H3V7H1V3h3zm4 11v4h9v-4M4 3v4M7 7h1m2 0h1m2 0h1'/>"},
-    {"connectors", "<rect x='2' y='2' width='6' height='6' rx='1'/><rect x='12' y='2' width='6' height='6' rx='1'/><rect x='2' y='12' width='6' height='6' rx='1'/><path d='M15 12v6m-3-3h6'/>"},
-    {"system-users", "<circle cx='7' cy='6' r='3'/><path d='M1 17v-2a6 6 0 0 1 12 0v2zm12-8a3 3 0 0 0 0-6m2 9a5 5 0 0 1 4 5'/>"},
-    {"plugins", "<path d='m6 2 3 3m5-1 3 3M8 4l8 8-3 3a5 5 0 0 1-7-7zM5 15l-3 3'/>"},
-    {"palette", "<path d='M10 2a8 8 0 1 0 0 16h1a2 2 0 0 0 1-3.7 1.5 1.5 0 0 1 1-2.8h2a3 3 0 0 0 3-3C18 5 14 2 10 2z'/><path d='M6 7h.1M10 5h.1M14 7h.1M5 11h.1' stroke-width='2'/>"},
-    {"globe", "<circle cx='10' cy='10' r='8'/><ellipse cx='10' cy='10' rx='3.5' ry='8'/><path d='M2 10h16'/>"},
-    {"research", "<circle cx='8.5' cy='8.5' r='6'/><path d='m13 13 4.5 4.5M5 9h2l1.5-3 2 5 1-2h2'/>"},
-    {"preferences-system", "<path d='m8 2-1 3-3 1 1 3-1 3 3 1 1 3h4l1-3 3-1-1-3 1-3-3-1-1-3z'/><circle cx='10' cy='9' r='2.5'/>"},
-    {"media-playback-stop", "<rect x='5' y='5' width='10' height='10' rx='1'/>"},
-    {"media-playback-start", "<path d='M6 4v12l10-6z'/>"},
+    {"window-diamond", "<path d='m10 4.5 5.5 5.5-5.5 5.5L4.5 10z'/>"},
+    {"list-add", "<path d='M10 3.5v13M3.5 10h13'/>"},
+    {"edit-find", "<circle cx='8.5' cy='8.5' r='5.5'/><path d='m12.7 12.7 4.3 4.3'/>"},
+    {"view-more", "<path d='M4 10h.1m5.9 0h.1m5.9 0h.1' stroke-width='2.4'/>"},
     {"view-list", "<path d='M7 5h10M7 10h10M7 15h10M3 5h.1M3 10h.1M3 15h.1'/>"},
-    {"computer", "<rect x='2.5' y='3' width='15' height='11' rx='1.5'/><path d='M10 14v3m-4 0h8'/>"},
+    {"session-idle", "<circle cx='10' cy='10' r='4' stroke-dasharray='1.2 2.2'/>"},
+    /* Sections */
+    {"user-available", "<path d='M6 3.5h8a3.5 3.5 0 0 1 3.5 3.5v4a3.5 3.5 0 0 1-3.5 3.5H9.5L6 17.5v-3a3.5 3.5 0 0 1-3.5-3.5V7A3.5 3.5 0 0 1 6 3.5z'/>"},
+    {"utilities-terminal", "<path d='m6.5 6-4 4 4 4m7-8 4 4-4 4M11.5 4l-3 12'/>"},
+    {"projects", "<path d='M4.5 3h11M2.5 7h15l-1.4 9a1.5 1.5 0 0 1-1.5 1.3H5.4A1.5 1.5 0 0 1 3.9 16z'/>"},
+    {"preferences-other", "<rect x='2.5' y='6.5' width='15' height='10.5' rx='2'/><path d='M7 6.5V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v1.5'/>"},
+    {"preferences-system", "<circle cx='10' cy='10' r='2.6'/><path d='M8.6 2.2h2.8l.4 2.1 1.5.9 2-.8 1.4 2.4-1.6 1.4v1.7l1.6 1.4-1.4 2.4-2-.8-1.5.9-.4 2.1H8.6l-.4-2.1-1.5-.9-2 .8-1.4-2.4 1.6-1.4V8.6L3.3 7.2l1.4-2.4 2 .8 1.5-.9z'/>"},
+    {"pin", "<path d='m7 2.5 10.5 10.5-3.7.9-3.3 3.3-5.7-5.7 3.3-3.3zM6.8 13.2 2.5 17.5'/>"},
+    {"archive", "<path d='M3 4.5h14v3H3zM4.5 7.5V16h11V7.5M8 11h4'/>"},
+    {"share", "<path d='M10 12.5V2.5m-3.5 3.5L10 2.5 13.5 6M6 9H4a1.5 1.5 0 0 0-1.5 1.5v5A1.5 1.5 0 0 0 4 17h12a1.5 1.5 0 0 0 1.5-1.5v-5A1.5 1.5 0 0 0 16 9h-2'/>"},
+    /* Messages */
+    {"thumb-up", "<path d='M6.5 9 9.8 2.6c1.2 0 2.2 1 2.2 2.2V8h4.1c1.2 0 2 1.1 1.8 2.2l-1.2 5.9a1.8 1.8 0 0 1-1.8 1.4H6.5zM6.5 9h-3a1 1 0 0 0-1 1v6.5a1 1 0 0 0 1 1h3'/>"},
+    {"thumb-down", "<path d='M13.5 11l-3.3 6.4c-1.2 0-2.2-1-2.2-2.2V12H3.9c-1.2 0-2-1.1-1.8-2.2l1.2-5.9a1.8 1.8 0 0 1 1.8-1.4h8.4zM13.5 11h3a1 1 0 0 0 1-1V3.5a1 1 0 0 0-1-1h-3'/>"},
+    {"regenerate", "<path d='M17 10a7 7 0 1 1-2.1-5L17 7M17 3v4h-4'/>"},
+    {"edit-copy", "<rect x='7' y='7' width='10.5' height='10.5' rx='2'/><path d='M13 7V4.5a2 2 0 0 0-2-2H4.5a2 2 0 0 0-2 2V11a2 2 0 0 0 2 2H7'/>"},
+    {"check", "<path d='m4 10.5 4 4 8-9'/>"},
+    {"warning", "<path d='M10 3 1.8 17h16.4zM10 8.5v4M10 14.8h.1'/>"},
+    {"help-about", "<circle cx='10' cy='10' r='7.5'/><path d='M10 9v5M10 6.2h.1' stroke-width='1.8'/>"},
+    {"task-open", "<rect x='3.5' y='3.5' width='13' height='13' rx='3'/>"},
+    {"task-done", "<rect x='3.5' y='3.5' width='13' height='13' rx='3'/><path d='m6.5 10.3 2.5 2.5 4.5-5.3'/>"},
+    /* Composer */
+    {"microphone", "<rect x='7' y='2.5' width='6' height='10' rx='3'/><path d='M4 9.5a6 6 0 0 0 12 0M10 15.5v2.5'/>"},
+    {"send", "<path d='M16.5 4v5a3 3 0 0 1-3 3H4m4-4-4 4 4 4'/>"},
+    {"media-playback-stop", "<rect x='5' y='5' width='10' height='10' rx='2'/>"},
+    {"media-playback-start", "<path d='M6.5 4v12l9.5-6z'/>"},
+    {"thinking", "<path d='M7 13.5c0-1.6-2.5-2.8-2.5-6a5.5 5.5 0 0 1 11 0c0 3.2-2.5 4.4-2.5 6zM7.5 16h5M8.5 18.5h3'/>"},
+    {"image", "<rect x='2.5' y='3.5' width='15' height='13' rx='2'/><circle cx='7' cy='8' r='1.5'/><path d='m17.5 12.5-3.8-3.8L5.5 16.5'/>"},
+    {"file", "<path d='M5 2.5h6.5l4 4V17a.5.5 0 0 1-.5.5H5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5zM11.5 2.5v4h4'/>"},
+    {"file-text", "<path d='M5 2.5h6.5l4 4V17a.5.5 0 0 1-.5.5H5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5zM11.5 2.5v4h4M7.5 10.5h5M7.5 13.5h5'/>"},
+    /* Projects and changes */
+    {"folder", "<path d='M2.5 5.5A1.5 1.5 0 0 1 4 4h3.6l2 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z'/>"},
+    {"folder-open", "<path d='M2.5 14.5v-9A1.5 1.5 0 0 1 4 4h3.6l2 2H15a1.5 1.5 0 0 1 1.5 1.5V9M2.5 14.5 4.3 10a1.5 1.5 0 0 1 1.4-1h11.1a1 1 0 0 1 .9 1.4l-1.5 4.7a1.5 1.5 0 0 1-1.4.9H4a1.5 1.5 0 0 1-1.5-1.5z'/>"},
+    {"computer", "<rect x='4' y='4.5' width='12' height='8.5' rx='1.2'/><path d='M2 16h16'/>"},
     {"network-server", "<rect x='3' y='3' width='14' height='6' rx='1.5'/><rect x='3' y='11' width='14' height='6' rx='1.5'/><path d='M6 6h.1M6 14h.1' stroke-width='2'/>"},
-    {"document-open", "<path d='M11 5.5 5.5 11a3 3 0 0 0 4.2 4.2l6.5-6.5a4.5 4.5 0 0 0-6.4-6.4L3.5 8.7m4 1.5 5-5'/>"},
-    {"document-edit", "<path d='m4 12 9-9 4 4-9 9-5 1zM11 5l4 4M3 18h14'/>"},
-    {"document-save", "<path d='M10 2.5v11m-4-4 4 4 4-4M3 13v4.5h14V13'/>"},
-    {"edit-copy", "<rect x='7' y='7' width='10' height='10' rx='1.5'/><path d='M12 7V3H3v9h4'/>"},
-    {"go-up", "<path d='M10 16V4m-5 5 5-5 5 5'/>"},
-    {"send", "<path d='M10 16V4m-5 5 5-5 5 5'/>"},
-    {"user-trash", "<path d='M3 5h14M7 5V2.5h6V5M5 5l1 12h8l1-12M8 8v6m4-6v6'/>"},
-    {"input-keyboard", "<rect x='1.5' y='5' width='17' height='10' rx='1.5'/><path d='M5 8h.1M8 8h.1M11 8h.1M14 8h.1M6 12h8' stroke-width='1.8'/>"},
-    {"help-about", "<circle cx='10' cy='10' r='8'/><path d='M10 9v5M10 6h.1' stroke-width='1.8'/>"},
-    {"application-exit", "<path d='M8 3H4v14h4M13 6l4 4-4 4M17 10H8'/>"},
-    {"check", "<path d='m4 10 4 4 8-8'/>"},
-    {"warning", "<path d='M10 3 2 17h16zM10 8v4M10 14.5h.1'/>"},
-    {"external", "<path d='M11 3h6v6M17 3l-8 8M8 4H3v13h13v-5'/>"},
+    {"git-branch", "<circle cx='5.5' cy='4.5' r='2'/><circle cx='5.5' cy='15.5' r='2'/><circle cx='14.5' cy='6.5' r='2'/><path d='M5.5 6.5v7M14.5 8.5c0 3-3 3.2-6.5 3.8-1.4.2-2.5 1-2.5 1.2'/>"},
+    {"file-diff", "<rect x='3.5' y='2.5' width='13' height='15' rx='2'/><path d='M10 5.8v5M7.5 8.3h5M7.5 14h5'/>"},
+    /* Menus */
+    {"skills", "<path d='M10 2.5 12 8l5.5 2-5.5 2-2 5.5L8 12l-5.5-2L8 8z'/>"},
+    {"system-users", "<circle cx='7.5' cy='6.5' r='3'/><path d='M2 17v-1a5.5 5.5 0 0 1 11 0v1M13 3.8a3 3 0 0 1 0 5.4M15.5 12.5A5.5 5.5 0 0 1 18 16.5v.5'/>"},
+    {"palette", "<path d='M10 2a8 8 0 1 0 0 16h1a2 2 0 0 0 1-3.7 1.5 1.5 0 0 1 1-2.8h2a3 3 0 0 0 3-3C18 5 14 2 10 2z'/><path d='M6 7h.1M10 5h.1M14 7h.1M5 11h.1' stroke-width='2'/>"},
+    {"document-open", "<path d='M16.5 9.5 10 16a4 4 0 0 1-5.7-5.7l6.7-6.7a2.7 2.7 0 0 1 3.8 3.8l-6.6 6.6a1.3 1.3 0 0 1-1.9-1.9L12.5 6'/>"},
+    {"document-edit", "<path d='m4 12.5 9-9 3.5 3.5-9 9L3 17zM11 5.5 14.5 9'/>"},
+    {"document-save", "<path d='M10 2.5v11m-4-4 4 4 4-4M3 14v2a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 17 16v-2'/>"},
+    {"user-trash", "<path d='M3 5h14M7.5 5V3.5A1 1 0 0 1 8.5 2.5h3a1 1 0 0 1 1 1V5M5 5l.8 11.1A1.5 1.5 0 0 0 7.3 17.5h5.4a1.5 1.5 0 0 0 1.5-1.4L15 5M8.5 8.5v5.5m3-5.5v5.5'/>"},
+    {"input-keyboard", "<rect x='1.5' y='4.5' width='17' height='11' rx='2'/><path d='M5 8h.1M8 8h.1M11 8h.1M14 8h.1M6 12h8' stroke-width='1.8'/>"},
+    {"application-exit", "<path d='M8 3H4.5A1.5 1.5 0 0 0 3 4.5v11A1.5 1.5 0 0 0 4.5 17H8M13 6l4 4-4 4M17 10H8'/>"},
 };
 
 /* Parsed geometry: a list of path commands with coordinates in the 20×20 grid. */
@@ -343,12 +347,13 @@ static Parsed *icon_parse(const char *name) {
     for (int i = 0; i < parsed_count; i++)
         if (!strcmp(parsed[i].name, name))
             return &parsed[i];
-    const char *svg = NULL;
+    const IconDef *def = NULL;
     for (size_t i = 0; i < CH_N_ELEMENTS(icons); i++)
         if (!strcmp(icons[i].name, name))
-            svg = icons[i].svg;
-    if (!svg)
+            def = &icons[i];
+    if (!def)
         return NULL;
+    const char *svg = def->svg;
     OpList l = {0};
     for (const char *tag = strchr(svg, '<'); tag; tag = strchr(tag + 1, '<')) {
         char buf[512];
@@ -369,7 +374,8 @@ static Parsed *icon_parse(const char *name) {
         emit(&l, OP_STROKE, stroke, 0, 0, 0, 0, 0);
     }
     parsed = ch_realloc(parsed, sizeof(Parsed) * (size_t)(parsed_count + 1));
-    parsed[parsed_count] = (Parsed){name, l.ops, l.count};
+    /* The table's own name: the caller's lives only until the next frame. */
+    parsed[parsed_count] = (Parsed){def->name, l.ops, l.count};
     return &parsed[parsed_count++];
 }
 void icon_paint(Cu *cu, CuCanvas *c, const char *name, float x, float y, float size, CuColor color) {

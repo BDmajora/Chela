@@ -5,6 +5,10 @@
 extern "C" {
 #include "ui/platform.h"
 }
+#include <QBuffer>
+#include <QDropEvent>
+#include <QMimeData>
+#include <QUrl>
 #include <QApplication>
 #include <QClipboard>
 #include <QFileDialog>
@@ -27,6 +31,9 @@ extern "C" {
 #include <unordered_map>
 #include <vector>
 
+struct CuImage {
+    QImage image;
+};
 struct CuCanvas {
     QPainter *painter;
     QPainterPath path;
@@ -111,6 +118,27 @@ int key_from(int key) {
 }
 } // namespace
 
+/* Files first, then text, then pictures: the same order as ch_clipboard_best. */
+static const char *mime_payload(const QMimeData *m, QByteArray *out) {
+    if (!m)
+        return nullptr;
+    if (m->hasUrls()) {
+        for (const QUrl &url : m->urls())
+            *out += url.toEncoded() + "\r\n";
+        return "text/uri-list";
+    }
+    if (m->hasText() && !m->text().isEmpty()) {
+        *out = m->text().toUtf8();
+        return "text/plain";
+    }
+    if (m->hasImage()) {
+        QBuffer buffer(out);
+        buffer.open(QIODevice::WriteOnly);
+        if (qvariant_cast<QImage>(m->imageData()).save(&buffer, "PNG"))
+            return "image/png";
+    }
+    return nullptr;
+}
 struct CuWindow final : QWidget {
     const CuWindowHandler *handler;
     void *data;
@@ -123,6 +151,7 @@ struct CuWindow final : QWidget {
         setAttribute(Qt::WA_NoSystemBackground);
         setMouseTracking(true);
         setFocusPolicy(Qt::StrongFocus);
+        setAcceptDrops(true);
         if (csd)
             setWindowFlag(Qt::FramelessWindowHint);
     }
@@ -193,6 +222,37 @@ protected:
     void leaveEvent(QEvent *) override {
         CuEvent ev{};
         ev.type = CU_EV_LEAVE;
+        send(ev);
+    }
+    void dragEnterEvent(QDragEnterEvent *e) override {
+        e->acceptProposedAction();
+        dragged(true, e->position());
+    }
+    void dragMoveEvent(QDragMoveEvent *e) override {
+        e->acceptProposedAction();
+        dragged(true, e->position());
+    }
+    void dragLeaveEvent(QDragLeaveEvent *) override {
+        dragged(false, QPointF());
+    }
+    void dropEvent(QDropEvent *e) override {
+        QByteArray bytes;
+        const char *mime = mime_payload(e->mimeData(), &bytes);
+        CuEvent ev{};
+        ev.type = CU_EV_DROP;
+        ev.mime = mime;
+        ev.data = bytes.constData();
+        ev.size = (size_t)bytes.size();
+        if (mime)
+            send(ev);
+        e->acceptProposedAction();
+    }
+    void dragged(bool inside, QPointF at) {
+        CuEvent ev{};
+        ev.type = CU_EV_DRAG;
+        ev.focused = inside;
+        ev.x = (float)at.x();
+        ev.y = (float)at.y();
         send(ev);
     }
     bool focusNextPrevChild(bool) override {
@@ -413,6 +473,12 @@ void clipboard_request(CuWindow *, void (*callback)(const char *, void *), void 
         callback(text.toUtf8().constData(), data);
 }
 
+void clipboard_request_data(CuWindow *, void (*callback)(const char *, const void *, size_t, void *), void *data) {
+    QByteArray bytes;
+    const char *mime = mime_payload(QGuiApplication::clipboard()->mimeData(), &bytes);
+    callback(mime, mime ? bytes.constData() : nullptr, (size_t)bytes.size(), data);
+}
+
 /* Text */
 CuFont *font_get(const CuFontDesc *desc) {
     std::string family = desc->family && *desc->family ? desc->family : "sans-serif";
@@ -491,6 +557,19 @@ void cv_fill_rect(CuCanvas *c, CuRect r, float radius, CuColor col) {
         c->painter->fillRect(QRectF(r.x, r.y, r.w, r.h), color(col));
     else
         c->painter->fillPath(rounded(r, radius), color(col));
+}
+CuImage *cv_image_new(const uint32_t *pixels, int width, int height) {
+    QImage view(reinterpret_cast<const uchar *>(pixels), width, height, width * 4, QImage::Format_ARGB32_Premultiplied);
+    return new CuImage{view.copy()};
+}
+void cv_image_free(CuImage *image) {
+    delete image;
+}
+void cv_draw_image(CuCanvas *c, CuImage *image, CuRect r, float radius) {
+    c->painter->save();
+    c->painter->setClipPath(rounded(r, radius), Qt::IntersectClip);
+    c->painter->drawImage(QRectF(r.x, r.y, r.w, r.h), image->image);
+    c->painter->restore();
 }
 void cv_stroke_rect(CuCanvas *c, CuRect r, float radius, float width, CuColor col) {
     if (!(col >> 24))
@@ -577,6 +656,7 @@ extern "C" __attribute__((visibility("default"))) const CuPlatform *chela_platfo
         p.timer_remove = timer_remove;
         p.clipboard_set = clipboard_set;
         p.clipboard_request = clipboard_request;
+        p.clipboard_request_data = clipboard_request_data;
         p.font_get = font_get;
         p.font_metrics = font_metrics;
         p.text_width = text_width;
@@ -594,6 +674,9 @@ extern "C" __attribute__((visibility("default"))) const CuPlatform *chela_platfo
         p.fill_path = cv_fill_path;
         p.stroke_path = cv_stroke_path;
         p.draw_text = cv_draw_text;
+        p.image_new = cv_image_new;
+        p.image_free = cv_image_free;
+        p.draw_image = cv_draw_image;
         p.file_dialog = file_dialog;
     }
     return &p;

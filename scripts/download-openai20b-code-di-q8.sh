@@ -2,7 +2,9 @@
 # Verified CODE-DI Q8_0 variant; this is distinct from CODE2-Plus.
 set -euo pipefail
 
-source "$HOME/inferssd/.venv/bin/activate"
+venv="$HOME/.local/share/chela/download-venv"
+[ -x "$venv/bin/hf" ] || { python3 -m venv "$venv" && "$venv/bin/pip" install huggingface_hub; }
+source "$venv/bin/activate"
 
 neo_destination="${1:-$HOME/models/OpenAI-20B-NEO-CODE-DI-Q8_0}"
 neo_filename='OpenAI-20B-NEO-CODE-DI-Uncensored-Q8_0.gguf'

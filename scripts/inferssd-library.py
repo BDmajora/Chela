@@ -7,6 +7,7 @@ give split GGUFs safe, stable paths. Only one model is resident at a time.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -26,6 +27,10 @@ SPLIT = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
 SSD_ARCHITECTURES = ("qwen4exp", "deepseek41", "muse-spark")
 # GGUF metadata value sizes by type: u8 i8 u16 i16 u32 i32 f32 bool _ _ u64 i64 f64 (8 string, 9 array).
 GGUF_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+GGUF_FORMATS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+# A vision encoder's GPU use is its weights plus the working memory it allocates: about half as much again. --fit
+# plans only the text model, so a model with one has to leave this much more free. It runs on the CPU in mode 2.
+VISION_MEMORY = 1.5
 # The routed experts' tensors, and ggml's tensor types: values and bytes of a block (ggml_type_traits).
 EXPERT_TENSOR = re.compile(r"blk\.\d+\.ffn_(up|gate|down)_exps\.weight")
 GGML_BLOCKS = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 9: (32, 40),
@@ -94,7 +99,7 @@ def discover(roots):
                 seen.add(real)
                 digest = hashlib.sha256(str(real).encode()).hexdigest()[:8]
                 safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", label).strip("-.")[:200] or "model"
-                models.append({"id": f"{safe}-{digest}", "parts": parts})
+                models.append({"id": f"{safe}-{digest}", "parts": parts, "projector": find_projector(path, root)})
     return sorted(models, key=lambda m: m["id"].lower()), skipped
 
 
@@ -114,30 +119,101 @@ def gguf_skip(stream, kind, depth=0):
         raise ValueError("unsupported GGUF metadata type")
 
 
+def gguf_fields(path):
+    """Each metadata key of a GGUF file with its value, in file order, reading no further than the caller does.
+    Numbers, booleans and short strings have values; anything else is None."""
+    with open(path, "rb") as stream:
+        magic, version, _tensors, count = struct.unpack("<4sIQQ", stream.read(24))
+        if magic != b"GGUF" or version not in (2, 3):
+            return
+        for _ in range(min(count, 65536)):
+            size = struct.unpack("<Q", stream.read(8))[0]
+            if size > 65536:
+                return
+            key = stream.read(size).decode("utf-8")
+            kind = struct.unpack("<I", stream.read(4))[0]
+            value = None
+            if kind in GGUF_FORMATS:
+                value = struct.unpack("<" + GGUF_FORMATS[kind], stream.read(GGUF_SIZES[kind]))[0]
+            elif kind == 8:
+                size = struct.unpack("<Q", stream.read(8))[0]
+                if size <= 256:
+                    value = stream.read(size).decode("utf-8")
+                else:
+                    stream.seek(size, os.SEEK_CUR)
+            else:
+                gguf_skip(stream, kind)
+            yield key, value
+
+
+GGUF_ERRORS = (OSError, ValueError, struct.error, UnicodeDecodeError)
+
+
 def gguf_architecture(path):
     """general.architecture of a GGUF file, or "" when it cannot be read; only the metadata before it is read."""
     try:
-        with open(path, "rb") as stream:
-            magic, version, _tensors, count = struct.unpack("<4sIQQ", stream.read(24))
-            if magic != b"GGUF" or version not in (2, 3):
-                return ""
-            for _ in range(min(count, 65536)):
-                size = struct.unpack("<Q", stream.read(8))[0]
-                if size > 65536:
-                    return ""
-                key = stream.read(size)
-                kind = struct.unpack("<I", stream.read(4))[0]
-                if key == b"general.architecture" and kind == 8:
-                    size = struct.unpack("<Q", stream.read(8))[0]
-                    return stream.read(size).decode("utf-8") if size <= 256 else ""
-                gguf_skip(stream, kind)
-    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        for key, value in gguf_fields(path):
+            if key == "general.architecture":
+                return value or ""
+    except GGUF_ERRORS:
         pass
     return ""
 
 
-def gguf_experts(path):
-    """The routed expert tensors of one GGUF file, from its header: (name, experts, bytes of an expert, file offset)."""
+def gguf_embedding(path):
+    """The size a text model's input embeddings have, which a vision file has to produce; 0 when unknown."""
+    architecture = None
+    try:
+        for key, value in gguf_fields(path):
+            if key == "general.architecture":
+                architecture = value
+            elif architecture and key == f"{architecture}.embedding_length":
+                return value
+    except GGUF_ERRORS:
+        pass
+    return 0
+
+
+def gguf_projection(path):
+    """What a vision file projects images to, or 0 when it is not a vision file (audio-only, or not one at all)."""
+    found = {}
+    try:
+        for key, value in gguf_fields(path):
+            found[key] = value
+    except GGUF_ERRORS:
+        return 0
+    if found.get("general.architecture") != "clip" or not found.get("clip.has_vision_encoder"):
+        return 0
+    return found.get("clip.vision.projection_dim") or 0
+
+
+def find_projector(model, root):
+    """The vision file for a model: an mmproj beside its weights, or one folder up, where a repository keeps it when
+    each quantization has a folder of its own. It must be a vision file of the size the model takes, because the server
+    refuses to start a model with a mismatched one, and a model that loads without images beats one that fails to load.
+    Of several, the closest in name wins (one folder can hold several models), then the most widely supported precision."""
+    folders = [model.parent]
+    if model.parent != root and model.parent.parent != root:
+        folders.append(model.parent.parent)
+    embedding = gguf_embedding(model)
+    stem = re.sub(r"[-_.]+", "-", model.stem).lower()
+    for folder in folders:
+        fitting = []
+        for candidate in sorted(p for p in folder.glob("*.gguf") if "mmproj" in p.name.lower()):
+            projection = gguf_projection(candidate)
+            if not projection or (embedding and projection != embedding):
+                continue
+            name = re.sub(r"[-_.]+", "-", candidate.stem).lower().replace("mmproj-", "").replace("-mmproj", "")
+            shared = len(os.path.commonprefix([stem, name]))
+            precision = next((i for i, tag in enumerate(("-f16", "-bf16", "-f32")) if f"-{name}".endswith(tag)), 3)
+            fitting.append((-shared, precision, candidate.name, candidate))
+        if fitting:
+            return min(fitting, key=lambda entry: entry[:3])[3]
+    return None
+
+
+def gguf_tensors(path):
+    """Every tensor in one GGUF file's header: [(name, shape, type, offset from the data start)], and that start."""
     with open(path, "rb") as stream:
         magic, version, tensors, count = struct.unpack("<4sIQQ", stream.read(24))
         if magic != b"GGUF" or version not in (2, 3):
@@ -156,13 +232,21 @@ def gguf_experts(path):
             dimensions = struct.unpack("<I", stream.read(4))[0]
             shape = struct.unpack(f"<{dimensions}Q", stream.read(8 * dimensions))
             kind, offset = struct.unpack("<IQ", stream.read(12))
-            if EXPERT_TENSOR.fullmatch(name):
-                if dimensions != 3 or kind not in GGML_BLOCKS or shape[0] % GGML_BLOCKS[kind][0]:
-                    raise ValueError(f"unsupported expert tensor {name}")
-                values, block = GGML_BLOCKS[kind]
-                found.append((name, shape[2], shape[0] // values * block * shape[1], offset))
-        data = -(-stream.tell() // alignment) * alignment
-    return [(name, experts, bytes_, data + offset) for name, experts, bytes_, offset in found]
+            found.append((name, shape, kind, offset))
+        return found, -(-stream.tell() // alignment) * alignment
+
+
+def gguf_experts(path):
+    """The routed expert tensors of one GGUF file, from its header: (name, experts, bytes of an expert, file offset)."""
+    tensors, data = gguf_tensors(path)
+    found = []
+    for name, shape, kind, offset in tensors:
+        if EXPERT_TENSOR.fullmatch(name):
+            if len(shape) != 3 or kind not in GGML_BLOCKS or shape[0] % GGML_BLOCKS[kind][0]:
+                raise ValueError(f"unsupported expert tensor {name}")
+            values, block = GGML_BLOCKS[kind]
+            found.append((name, shape[2], shape[0] // values * block * shape[1], data + offset))
+    return found
 
 
 def write_expert_index(path, links):
@@ -179,29 +263,48 @@ def write_expert_index(path, links):
 
 
 def model_options(config, data, model, links):
-    """Per-model preset options. Router mode gives command-line options precedence over a model's section, so in mode 3
-    the placement options live here: InferSSD's expert caches for a supported architecture, fit for the rest."""
-    if config.get("memory_mode", 0) != 3:
+    """Per-model preset options. Router mode gives command-line options precedence over a model's section, so what
+    differs by model lives here: the room a vision encoder needs in every mode that plans GPU memory, and in mode 3
+    the placement options, InferSSD's expert caches for a supported architecture and fit for the rest."""
+    mode = config.get("memory_mode", 0)
+    headroom = config.get("gpu_headroom", 1024)
+    if model.get("projector"):
+        headroom += math.ceil(model["projector"].stat().st_size / 2 ** 20 * VISION_MEMORY)
+    if mode == 2:
         return []
+    if mode != 3:
+        return [f"fit-target = {headroom}"]
     index = links[0].parent / "experts.tsv"
     try:
         routed = gguf_architecture(links[0]) in SSD_ARCHITECTURES and write_expert_index(index, links)
     except (OSError, ValueError, struct.error, UnicodeDecodeError):
         routed = False
     if not routed:
-        return ["gpu-layers = auto", "fit = on", f"fit-target = {config.get('gpu_headroom', 1024)}"]
+        return ["gpu-layers = auto", "fit = on", f"fit-target = {headroom}"]
     traces = data / "traces"
     traces.mkdir(exist_ok=True, mode=0o700)
     return [
         "ssd-expert-source = " + json.dumps([str(index)]),
         "ssd-vram-budget = auto",
         # The tier grows until only this is left, and a long prompt's scratch comes out of it.
-        f"ssd-vram-reserve-mib = {config.get('gpu_headroom', 1024)}",
+        f"ssd-vram-reserve-mib = {headroom}",
         # The expert predictor's traces and usage profile, kept for this model across restarts.
         "ssd-trace-file = " + json.dumps([str(traces / (model["id"] + ".trace"))]),
         # The sink reads the experts: mapped, their pages stay unread.
         "gpu-layers = 99", "fit = off", "mmap = true", "repack = false", "defer-experts = true",
     ]
+
+
+def managed_link(link, target):
+    """Point a symlink Chela owns at target, or remove it when there is none; returns the link if it now exists."""
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        raise RuntimeError(f"Expected a managed symlink at {link}; no model file was overwritten.")
+    if not target:
+        return None
+    link.symlink_to(target.absolute())
+    return link
 
 
 def prepare(config, data):
@@ -218,14 +321,11 @@ def prepare(config, data):
         links = []
         for i, part in enumerate(model["parts"], 1):
             name = "model.gguf" if len(model["parts"]) == 1 else f"model-{i:05d}-of-{len(model['parts']):05d}.gguf"
-            link = folder / name
-            if link.is_symlink():
-                link.unlink()
-            elif link.exists():
-                raise RuntimeError(f"Expected a managed symlink at {link}; no model file was overwritten.")
-            link.symlink_to(part.absolute())
-            links.append(link)
-        preset += [f"[{model['id']}]", f"model = {links[0]}", *model_options(config, data, model, links), ""]
+            links.append(managed_link(folder / name, part))
+        # A vision file that has since been removed must not leave a link behind.
+        vision = managed_link(folder / "mmproj.gguf", model.get("projector"))
+        section = [f"model = {links[0]}"] + ([f"mmproj = {vision}"] if vision else [])
+        preset += [f"[{model['id']}]", *section, *model_options(config, data, model, links), ""]
     atomic_write(data / "models.ini", "\n".join(preset))
     (data / "cache").mkdir(exist_ok=True, mode=0o700)
     return models, skipped
@@ -240,9 +340,9 @@ def command(config, data):
             not 512 <= context <= 131072 or type(headroom) is not int or not 256 <= headroom <= 65536 or
             not isinstance(device, str) or not re.fullmatch(r"[A-Za-z0-9_,-]+", device)):
         raise RuntimeError("Invalid memory settings. Reconnect using Model library setup.")
-    # Mode 3 places each model in its preset section (model_options): options given here would override it.
-    placement = [] if mode == 3 else ["--gpu-layers", "0" if mode == 2 else "auto", "--fit", "off" if mode == 2 else "on",
-                                      "--fit-target", str(headroom)]
+    # Options given here would override a model's preset section (model_options), so nothing that differs by model
+    # is here: mode 3 places every model there, and each model's fit target depends on its vision file.
+    placement = [] if mode == 3 else ["--gpu-layers", "0" if mode == 2 else "auto", "--fit", "off" if mode == 2 else "on"]
     args = [config["server"], "--models-preset", str(data / "models.ini"),
             "--models-max", "1", "--models-autoload", "--device", "none" if mode == 2 else device,
             *placement, "--ctx-size", str(context),
@@ -252,6 +352,8 @@ def command(config, data):
             "--parallel", "1", "--jinja", "--host", "127.0.0.1", "--port", str(config["port"])]
     if mode == 1:
         args.append("--cpu-moe")
+    if mode == 2:
+        args.append("--no-mmproj-offload")  # --device none does not cover the vision encoder
     return args
 
 
@@ -348,7 +450,10 @@ def gpu_usage(drm=Path("/sys/class/drm"), nvidia=Path("/proc/driver/nvidia")):
 
 
 def process_memory(server, port, proc=Path("/proc")):
-    """Resident RAM of the model's own server process, found by its router-assigned port."""
+    """Resident RAM of the model's own server process, found by its router-assigned port.
+
+    file_mib and anon_mib split it into mapped weights and allocated memory.
+    """
     wanted = ["--port", str(port)]
     for entry in proc.iterdir():
         if not entry.name.isdigit():
@@ -358,9 +463,15 @@ def process_memory(server, port, proc=Path("/proc")):
             args = [arg.decode(errors="replace") for arg in args]
             if Path(args[0]).name != Path(server).name or not any(args[i:i + 2] == wanted for i in range(len(args))):
                 continue
-            match = re.search(r"^VmRSS:\s+(\d+)\s+kB", (entry / "status").read_text(), re.M)
+            status = (entry / "status").read_text()
+            match = re.search(r"^VmRSS:\s+(\d+)\s+kB", status, re.M)
             if match:
-                return {"pid": int(entry.name), "rss_mib": round(int(match[1]) / 1024)}
+                result = {"pid": int(entry.name), "rss_mib": round(int(match[1]) / 1024)}
+                for key, name in (("file_mib", "RssFile"), ("anon_mib", "RssAnon")):
+                    part = re.search(rf"^{name}:\s+(\d+)\s+kB", status, re.M)
+                    if part:
+                        result[key] = round(int(part[1]) / 1024)
+                return result
         except (OSError, IndexError):
             continue
     return None
@@ -392,6 +503,79 @@ def slot_activity(port, opener):
     return {"available": True, "processing": False}
 
 
+def child_output(logs, model):
+    """The port and output of the selected model's most recent process, or (None, "") when it has exited."""
+    spawns = list(re.finditer(r"spawning server instance with name=(\S+) on port (\d+)", logs))
+    matching = [spawn for spawn in spawns if spawn[1] == model]
+    if not matching:
+        return None, ""
+    spawn = matching[-1]
+    section = logs[spawn.end():]
+    if re.search(r"instance name=" + re.escape(model) + r" exited with status", section):
+        return None, ""
+    # Child output is forwarded with [port]. Never use untagged discovery logs or another child's lines.
+    tag = re.compile(r"^.*?\[\s*" + spawn[2] + r"\] ?")
+    return int(spawn[2]), "\n".join(tag.sub("", line) for line in section.splitlines() if tag.match(line))
+
+
+def load_stage(child):
+    """How far the server's load has got, from the milestones it logs (engine: llama_model_load_from_file, then
+    llama_init_from_model). Reading maps the weights into memory; uploading copies them to their devices."""
+    for stage, mark in (("warming", "warming up the model"), ("context", "constructing llama_context"),
+                        ("uploading", " model buffer size = "), ("reading", "loading model tensors")):
+        if mark in child:
+            return stage
+    return "starting"
+
+
+def lazy_shard(path):
+    """Whether a shard only holds per-layer token tables, which the engine maps without reading (PLE lazy mmap)."""
+    try:
+        tensors, _ = gguf_tensors(path)
+    except (OSError, ValueError, struct.error, UnicodeDecodeError):
+        return False
+    return bool(tensors) and all(name.endswith("per_layer_token_embd.weight") for name, *_ in tensors)
+
+
+def upload_percent(child, process_io):
+    """The engine prints one dot per percent while copying weights. They sit in the router's line buffer until the
+    line ends, so they never reach the log during the copy, but the model process's written-bytes counter sees them:
+    what it has written beyond what the log shows is the dots so far."""
+    try:
+        written = int(re.search(r"^wchar:\s+(\d+)", process_io, re.M)[1])
+    except (TypeError, ValueError):
+        return None
+    dots = written - sum(len(line.encode("utf-8", "replace")) + 1 for line in child.splitlines())
+    return dots if 0 <= dots <= 110 else None
+
+
+def load_progress(folder, child, process, proc=Path("/proc")):
+    """What a running load has done so far. Chela turns these readings into its bar and ETA."""
+    parts = sorted(folder.glob("model*.gguf"))
+    file_bytes, lazy_bytes = 0, 0
+    for part in parts:
+        try:
+            size = part.stat().st_size
+        except OSError:
+            continue
+        file_bytes += size
+        lazy_bytes += size if len(parts) > 1 and lazy_shard(part) else 0
+    stage = load_stage(child)
+    report = {"phase": stage, "file_mib": round(file_bytes / 2**20), "target_mib": round((file_bytes - lazy_bytes) / 2**20)}
+    if process:
+        report["mapped_mib"] = max(process.get("file_mib", 0), process.get("anon_mib", 0))
+    report["gpu_mib"] = round(sum(float(size) for identifier, size in re.findall(
+        r"\b([A-Za-z0-9_-]+)\s+model buffer size\s*=\s*([0-9.]+)\s*MiB", child) if not HOST_BUFFERS.match(identifier)))
+    if stage == "uploading" and process:
+        try:
+            percent = upload_percent(child, (proc / str(process["pid"]) / "io").read_text())
+        except OSError:
+            percent = None
+        if percent is not None:
+            report["upload_percent"] = percent
+    return report
+
+
 def model_device_status(config, model, state, service, logs, cpu):
     """Use a selected model's current child log, never another model's GPU log.
 
@@ -412,19 +596,14 @@ def model_device_status(config, model, state, service, logs, cpu):
     if service.get("ActiveState") != "active" or state not in ("loaded", "loading"):
         status["evidence"] = f"Model state: {state or 'unknown'}; service: {service.get('ActiveState', 'unknown')}."
         return status
-    spawns = list(re.finditer(r"spawning server instance with name=(\S+) on port (\d+)", logs))
-    matching = [spawn for spawn in spawns if spawn[1] == model]
-    if not matching:
+    spawned = any(spawn[1] == model for spawn in re.finditer(r"spawning server instance with name=(\S+) on port", logs))
+    if not spawned:
         return status
-    spawn = matching[-1]
-    section = logs[spawn.end():]
-    # Child output is forwarded with [port]. Never use untagged discovery logs
-    # or a concurrently loading child's tensor allocation.
-    child = "\n".join(line for line in section.splitlines() if re.search(r"\[\s*" + spawn[2] + r"\]", line))
-    if re.search(r"instance name=" + re.escape(model) + r" exited with status", section):
+    port, child = child_output(logs, model)
+    if port is None:
         status["evidence"] = "The model process exited; its previous device placement is no longer current."
         return status
-    status["port"] = int(spawn[2])
+    status["port"] = port
     used = []
     # Newer builds follow the name with a PCI address: "(AMD Radeon RX 6800) (0000:0a:00.0)".
     for identifier, name in re.findall(r"using device\s+([A-Za-z0-9_-]+)\s*\(([^()]+)\)", child):
@@ -469,7 +648,7 @@ def model_device_status(config, model, state, service, logs, cpu):
 
 def device_status(model):
     """Read-only status; this never loads a model, restarts, or changes setup."""
-    config_dir, _ = locations()
+    config_dir, data = locations()
     config = json.loads((config_dir / "inferssd-library.json").read_text())
     result = subprocess.run(["systemctl", "--user", "show", SERVICE,
                              "--property=ActiveState,SubState,Result,ExecMainStatus,NRestarts,InvocationID"],
@@ -507,6 +686,11 @@ def device_status(model):
         process = process_memory(config["server"], status["port"])
         if process:
             live["process"] = process
+        if state == "loading":
+            try:
+                status["load"] = load_progress(data / "models" / model, child_output(logs, model)[1], process)
+            except (OSError, ValueError):  # the bar falls back to the last load's timing
+                pass
     if opener and status.get("port") and state == "loaded":
         live["slot"] = slot_activity(status["port"], opener)
     status["live"] = live
@@ -633,7 +817,7 @@ def main():
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--device-status", action="store_true")
     parser.add_argument("--model", default="")
-    parser.add_argument("--server", default="~/inferssd/build-rocm/bin/inferssd-server")
+    parser.add_argument("--server", default="~/Chela-Server/build-linux-rocm/bin/inferssd-server")
     parser.add_argument("--model-dir", default="~/models")
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--memory-mode", type=int, choices=(0, 1, 2, 3), default=0,

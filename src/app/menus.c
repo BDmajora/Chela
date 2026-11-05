@@ -1,5 +1,6 @@
 /* Popup menus: one menu tree is open at a time; submenus open on hover. */
 #include "app.h"
+#include <ctype.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,7 @@ void menu_close(App *a) {
     m->models = NULL;
     ch_clear_pointer(&m->models_error, free);
     m->models_loading = false;
+    ch_clear_pointer(&m->target, free);
     m->kind = MENU_NONE;
     m->generation++;
     cu_invalidate(a->cu);
@@ -52,12 +54,15 @@ void menu_open(App *a, int kind, CuId anchor, bool align_end) {
     a->menu.kind = kind;
     a->menu.anchor = anchor;
     a->menu.align_end = align_end;
+    a->menu.at_pointer = false;
     for (int i = 0; i < 4; i++) {
         a->menu.sub[i] = a->menu.cursor[i] = -1;
         a->menu.count[i] = 0;
     }
     a->menu.depth = 0;
     a->menu.activate_level = -1;
+    if (kind == MENU_PROJECT)
+        a->last_git_poll = 0; /* the Branch row should list what is there now */
     if (kind == MENU_MODEL && a->config.provider != 5 && ensure_model_tunnel(a)) {
         ModelProbe *p = ch_new0(ModelProbe, 1);
         p->app = a;
@@ -68,14 +73,26 @@ void menu_open(App *a, int kind, CuId anchor, bool align_end) {
         app_run(a, model_probe_work, model_probe_done, p);
     }
 }
+/* Right click: at the pointer, and about the thing under it. */
+void menu_open_here(App *a, int kind, CuId anchor, const char *target) {
+    menu_open(a, kind, anchor, false);
+    if (a->menu.kind != kind)
+        return;
+    a->menu.at_pointer = true;
+    a->menu.x = cu_mouse_x(a->cu);
+    a->menu.y = cu_mouse_y(a->cu);
+    a->menu.target = ch_strdup(target);
+}
 
 /* Items */
-enum { ITEM_ENABLED = 1, ITEM_SUBMENU = 2 };
+enum { ITEM_ENABLED = 1, ITEM_SUBMENU = 2, ITEM_OPENS_LEFT = 4 };
 static CuId item_id(App *a, bool enabled, bool submenu) {
     Menu *m = &a->menu;
     int level = m->level, index = m->index[level]++;
-    if (index < MENU_ITEMS)
+    if (index < MENU_ITEMS) {
         m->flags[level][index] = (enabled ? ITEM_ENABLED : 0) | (submenu ? ITEM_SUBMENU : 0);
+        m->keys[level][index] = 0;
+    }
     if (enabled && m->cursor[level] == -2)
         m->cursor[level] = index;
     return cu_idn(a->cu, "#menu-item", level * 1000 + index);
@@ -108,26 +125,50 @@ static void item_body(App *a, CuId id, const char *icon, const char *title, cons
     if (icon)
         cu_icon(cu, icon, 18, enabled ? (destructive ? C_DANGER : 0xffd4d4d4) : 0xff7a7a7a);
     cu_open(cu, 0, &(CuBox){.gap = 3, .w = CU_GROW});
+    /* Room for a model id whole; past that the middle goes, since ends are what tell names apart. */
     cu_text(cu, 0, title,
-            &(CuTextStyle){.font = ui_font(a, 14, 400), .color = color, .ellipsize = CU_ELLIPSIZE_END, .w = CU_FIT_MAX(300)});
+            &(CuTextStyle){.font = ui_font(a, 14, 400), .color = color, .ellipsize = CU_ELLIPSIZE_MIDDLE, .w = CU_FIT_MAX(380)});
     if (detail)
         cu_text(cu, 0, detail,
                 &(CuTextStyle){.font = ui_font(a, 12, 400), .color = C_MUTED, .wrap = CU_WRAP_WORD, .w = CU_GROW_MAX(280)});
     cu_close(cu);
-    if (trailing && !strcmp(trailing, "✓"))
+    if (trailing && ch_str_has_prefix(trailing, "✓")) {
         cu_icon(cu, "check", 16, C_CHECK);
-    else if (trailing)
-        cu_text(cu, 0, trailing, &(CuTextStyle){.font = ui_font(a, 13, 400), .color = C_MUTED});
+        trailing += strlen("✓");
+    }
+    if (trailing && *trailing)
+        cu_text(cu, 0, trailing,
+                &(CuTextStyle){.font = ui_font(a, 13, 400), .color = C_MUTED, .ellipsize = CU_ELLIPSIZE_MIDDLE, .w = CU_FIT_MAX(170)});
     if (chevron)
         cu_icon(cu, "chevron-right", 14, C_MUTED);
     cu_close(cu);
 }
+/* Reaching an item closes the submenu open beside it, unless the pointer is on its way
+ * there: Effort's submenu rises past the rows above it, and a diagonal crosses them. */
+static void item_leaves_submenu(App *a, CuId id, bool enabled) {
+    Menu *m = &a->menu;
+    int open = m->sub[m->level];
+    if (!enabled || !m->moved || !cu_hovered(a->cu, id) || open < 0)
+        return;
+    bool towards = open < MENU_ITEMS && (m->flags[m->level][open] & ITEM_OPENS_LEFT) && m->mouse_dx < 0;
+    if (!towards)
+        m->sub[m->level] = -1;
+}
+/* One letter or digit at the end of a row is that row's key. */
+static void item_key(App *a, const char *trailing) {
+    Menu *m = &a->menu;
+    int index = m->index[m->level] - 1;
+    if (trailing && ch_str_has_prefix(trailing, "✓"))
+        trailing += strlen("✓");
+    if (index < MENU_ITEMS && trailing && isalnum((unsigned char)*trailing) && !trailing[1])
+        m->keys[m->level][index] = (uint8_t)tolower((unsigned char)*trailing);
+}
 bool menu_item(App *a, const char *icon, const char *title, const char *detail, const char *trailing, bool enabled,
                const char *tooltip) {
     CuId id = item_id(a, enabled, false);
+    item_key(a, trailing);
     item_body(a, id, icon, title, detail, trailing, enabled, false, false, tooltip);
-    if (enabled && a->menu.moved && cu_hovered(a->cu, id))
-        a->menu.sub[a->menu.level] = -1;
+    item_leaves_submenu(a, id, enabled);
     if (item_chosen(a, id, enabled)) {
         menu_close(a);
         return true;
@@ -136,14 +177,26 @@ bool menu_item(App *a, const char *icon, const char *title, const char *detail, 
 }
 bool menu_item_destructive(App *a, const char *icon, const char *title, const char *trailing, bool enabled) {
     CuId id = item_id(a, enabled, false);
+    item_key(a, trailing);
     item_body(a, id, icon, title, NULL, trailing, enabled, true, false, NULL);
-    if (enabled && a->menu.moved && cu_hovered(a->cu, id))
-        a->menu.sub[a->menu.level] = -1;
+    item_leaves_submenu(a, id, enabled);
     if (item_chosen(a, id, enabled)) {
         menu_close(a);
         return true;
     }
     return false;
+}
+/* A setting in a menu. Choosing it leaves the menu open, so the switch shows what happened. */
+bool menu_switch(App *a, const char *title, const char *tooltip, bool on, bool enabled) {
+    Cu *cu = a->cu;
+    CuId id = item_id(a, enabled, false);
+    cu_open(cu, id, &(CuBox){.row = true, .gap = 10, CU_PAD2(5, 10), .radius = 5, .w = CU_GROW, .align_y = CU_CENTER,
+                             .bg = item_hot(a, id, enabled) ? C_MENU_HOVER : 0, .interactive = true, .tooltip = tooltip});
+    cu_text(cu, 0, title, &(CuTextStyle){.font = ui_font(a, 14, 400), .color = enabled ? C_TEXT : 0xff969696, .w = CU_GROW});
+    ui_switch_mark(a, on, enabled);
+    cu_close(cu);
+    item_leaves_submenu(a, id, enabled);
+    return item_chosen(a, id, enabled);
 }
 void menu_heading(App *a, const char *text) {
     cu_open(a->cu, 0, &(CuBox){CU_PAD2(5, 10), .w = CU_GROW});
@@ -161,16 +214,18 @@ static void layer_begin(App *a, CuId anchor, int placement, bool align_end, floa
     CuId layer = cu_idn(a->cu, "#menu-layer", m->level);
     m->layer[m->level] = layer;
     cu_layer_open(a->cu, layer,
-                  &(CuLayer){.kind = CU_LAYER_POPUP, .anchor = anchor, .placement = (uint8_t)placement,
-                             .align_end = align_end, .offset = placement == CU_PLACE_RIGHT ? 6 : 4},
+                  &(CuLayer){.kind = CU_LAYER_POPUP, .anchor = anchor, .placement = (uint8_t)placement, .x = m->x, .y = m->y,
+                             .align_end = align_end, .offset = placement == CU_PLACE_RIGHT || placement == CU_PLACE_LEFT ? 6 : 4},
                   &(CuBox){CU_PAD(5), .bg = C_MENU, .border = 1, .border_color = C_MENU_BORDER, .radius = 12,
                            .shadow = 14, .w = CU_FIT_MIN(min_width)});
 }
-bool menu_sub_begin(App *a, const char *icon, const char *title, const char *trailing, bool enabled,
-                    const char *tooltip) {
+static bool sub_begin(App *a, const char *icon, const char *title, const char *trailing, bool enabled,
+                      const char *tooltip, bool left) {
     Menu *m = &a->menu;
     int level = m->level, index = m->index[level];
     CuId id = item_id(a, enabled, true);
+    if (left && index < MENU_ITEMS)
+        m->flags[level][index] |= ITEM_OPENS_LEFT;
     item_body(a, id, icon, title, NULL, trailing, enabled, false, true, tooltip);
     if (enabled && ((m->moved && cu_hovered(a->cu, id)) || cu_clicked(a->cu, id)))
         m->sub[level] = index;
@@ -180,8 +235,12 @@ bool menu_sub_begin(App *a, const char *icon, const char *title, const char *tra
     m->depth = CH_MAX(m->depth, m->level);
     m->index[m->level] = 0;
     m->sub[m->level] = m->sub[m->level] < -1 ? -1 : m->sub[m->level];
-    layer_begin(a, id, CU_PLACE_RIGHT, false, 214);
+    layer_begin(a, id, left ? CU_PLACE_LEFT : CU_PLACE_RIGHT, left, 214);
     return true;
+}
+bool menu_sub_begin(App *a, const char *icon, const char *title, const char *trailing, bool enabled,
+                    const char *tooltip) {
+    return sub_begin(a, icon, title, trailing, enabled, tooltip, false);
 }
 void menu_sub_end(App *a) {
     Menu *m = &a->menu;
@@ -207,13 +266,26 @@ static int next_item(const Menu *m, int level, int from, int step) {
 }
 /* Keyboard navigation, before anything else takes the keys: Up/Down/Home/End move
  * within the deepest open menu, Right or Return opens a submenu, Left closes it,
- * Return activates. Escape is handled by the popup layer. */
+ * Return activates. A submenu that opens to the left swaps those arrows. Escape is
+ * handled by the popup layer. */
 void menu_keys(App *a) {
     Menu *m = &a->menu;
     Cu *cu = a->cu;
     if (!m->kind || m->kind == MENU_MODEL_PANEL)
         return;
     int level = CH_CLAMP(m->depth, 0, 3), n = CH_MIN(m->count[level], MENU_ITEMS), *cursor = &m->cursor[level];
+    int parent = level > 0 ? m->sub[level - 1] : -1;
+    bool in_left = parent >= 0 && parent < MENU_ITEMS && (m->flags[level - 1][parent] & ITEM_OPENS_LEFT);
+    bool opens_left = *cursor >= 0 && *cursor < n && (m->flags[level][*cursor] & ITEM_OPENS_LEFT);
+    /* By the character typed, so that it does not also land in the composer. */
+    for (int i = 0; i < n; i++)
+        if (m->keys[level][i] && (m->flags[level][i] & ITEM_ENABLED) && cu_typed(cu, m->keys[level][i])) {
+            m->activate_level = level;
+            m->activate_index = i;
+            m->keyed = true;
+            cu_invalidate(cu);
+            return;
+        }
     if (cu_key(cu, CU_KEY_DOWN, 0))
         *cursor = next_item(m, level, *cursor < 0 ? -1 : *cursor, 1);
     else if (cu_key(cu, CU_KEY_UP, 0))
@@ -222,10 +294,11 @@ void menu_keys(App *a) {
         *cursor = next_item(m, level, -1, 1);
     else if (cu_key(cu, CU_KEY_END, 0))
         *cursor = next_item(m, level, n, -1);
-    else if (cu_key(cu, CU_KEY_LEFT, 0) && level > 0) {
+    else if (level > 0 && cu_key(cu, in_left ? CU_KEY_RIGHT : CU_KEY_LEFT, 0)) {
         m->sub[level - 1] = -1;
         *cursor = -1;
-    } else if (*cursor >= 0 && *cursor < n && (cu_key(cu, CU_KEY_RIGHT, 0) || cu_key(cu, CU_KEY_RETURN, 0))) {
+    } else if (*cursor >= 0 && *cursor < n &&
+               (cu_key(cu, CU_KEY_RIGHT, 0) || cu_key(cu, CU_KEY_RETURN, 0) || (opens_left && cu_key(cu, CU_KEY_LEFT, 0)))) {
         if (m->flags[level][*cursor] & ITEM_SUBMENU) {
             m->sub[level] = *cursor;
             if (level < 3)
@@ -236,43 +309,45 @@ void menu_keys(App *a) {
         }
     } else
         return;
+    m->keyed = true;
     cu_invalidate(cu);
 }
 
 /* Menu contents */
-static void thinking_menu(App *a) {
-    menu_heading(a, "Thinking / reasoning");
-    bool supported = ch_thinking_supported(&a->config), gpt = ch_model_is_gpt_oss(&a->config);
-    const char *details[] = {"Use the model's default behavior", "Skip optional thinking for faster replies",
-                             "Shorter reasoning for everyday questions", "More room to work through a question",
-                             "More reasoning for difficult tasks; may be slower"};
-    for (int i = CH_THINK_DEFAULT; i <= CH_THINK_DEEP; i++) {
-        bool enabled = (supported || i == CH_THINK_DEFAULT) && !(gpt && i == CH_THINK_OFF);
-        if (menu_item(a, NULL, ch_thinking_name(i), i == CH_THINK_OFF && gpt ? "GPT-OSS always reasons; choose Quick" : details[i],
-                      ch_thinking_effective(&a->config) == (ChThinking)i ? "✓" : NULL, enabled, NULL) && !a->busy) {
-            ChConfig config = a->config;
-            config.thinking = (ChThinking)i;
-            app_save_config(a, &config, "Could not save thinking setting");
-        }
-    }
-    menu_separator(a);
-    const char *note = !supported ? "Use the server or harness settings for this connection"
-                     : a->config.provider == 6 && !gpt ? "Thinking shares your response limit. Availability depends on the model."
-                                                       : "Availability depends on the model. Some models only support thinking on or off.";
-    menu_item(a, NULL, "Model support", note, NULL, false, NULL);
+static void enable_bypass(App *a, void *data) {
+    (void)data;
+    a->bypass_enabled = true;
+    app_set_mode(a, CH_BYPASS);
 }
+/* Bypass waits behind Enable: one stray click should not turn every question off. */
 static void mode_menu(App *a) {
     menu_heading(a, "Mode");
-    const char *titles[] = {"Manual", "Accept edits", "Plan", "Bypass permissions"};
-    const char *descriptions[] = {"Ask before editing files or running commands",
-                                  a->config.provider == 5 ? "Harness actions still ask for approval"
-                                                          : "Apply file edits; ask before running commands",
-                                  "Explore your project without making changes",
-                                  "Run edits and commands without approval prompts"};
-    const ChMode values[] = {CH_ASK, CH_ACCEPT_EDITS, CH_PLAN, CH_AUTO};
-    for (int i = 0; i < 4; i++)
-        if (menu_item(a, NULL, titles[i], NULL, a->mode == values[i] ? "✓" : NULL, true, descriptions[i]))
-            app_set_mode(a, values[i]);
+    const ChMode modes[] = {CH_AUTO, CH_ASK, CH_ACCEPT_EDITS, CH_PLAN};
+    const char *details[] = {"Chela handles permission decisions", "Always ask before making changes",
+                             "Automatically accept all file edits", "Create a plan before making changes"};
+    const char *tooltips[] = {a->config.provider == 5
+                                  ? "Reading and editing in this session run. Commands run if they change nothing; "
+                                    "the rest ask, because a harness runs outside Chela's sandbox."
+                                  : "Edits and sandboxed commands run. Pushing, publishing, deleting folders and "
+                                    "anything the sandbox can't hold ask first.",
+                              NULL, NULL, NULL};
+    for (int i = 0; i < 4; i++) {
+        char *key = ch_strdup_printf("%s%d", a->mode == modes[i] ? "✓" : "", i + 1);
+        if (menu_item(a, NULL, ch_mode_name(modes[i]), details[i], key, true, tooltips[i]))
+            app_set_mode(a, modes[i]);
+        free(key);
+    }
+    bool offered = a->bypass_enabled || a->mode == CH_BYPASS;
+    if (menu_item(a, NULL, ch_mode_name(CH_BYPASS), offered ? "Run edits and commands without asking" : NULL,
+                  !offered ? "Enable" : a->mode == CH_BYPASS ? "✓5" : "5", true, NULL)) {
+        if (offered)
+            app_set_mode(a, CH_BYPASS);
+        else
+            dialog_confirm(a, "Enable Bypass permissions?",
+                           "Edits and commands will run without asking, including ones that push, publish or delete. "
+                           "Chela's own commands stay inside this session's folders. An ACP harness's do not.",
+                           "Enable", true, enable_bypass, NULL);
+    }
 }
 static void interaction_menu(App *a) {
     menu_heading(a, "Interaction");
@@ -342,131 +417,145 @@ static void skills_menu(App *a) {
     if (menu_item(a, "document-open", "Add instructions from file…", NULL, NULL, true, NULL))
         app_attach_file(a);
 }
-static void extension_menu(App *a, bool plugins) {
-    menu_heading(a, plugins ? "Plugins" : "Connectors");
-    menu_item(a, NULL,
-              a->config.provider == 5 ? "Managed by your ACP harness" : plugins ? "No plugins connected" : "No connectors connected",
-              a->config.provider == 5 ? "Configure extensions in your harness." : "Available through a configured ACP harness.",
-              NULL, false, NULL);
-}
-/* Recent project folders, the selected one first. */
-static ChVec *recent_projects(App *a, size_t limit) {
+/* Recent project folders, the selected one first. Chats have none. */
+ChVec *recent_projects(App *a, size_t limit) {
     ChVec *out = ch_vec_new(free);
-    ch_vec_push(out, ch_strdup(a->project));
+    if (*a->project)
+        ch_vec_push(out, ch_strdup(a->project));
     ChVec *sessions = ch_store_list(a->store, "", NULL);
     for (size_t i = 0; sessions && i < sessions->len && out->len < limit; i++) {
         ChSession *s = sessions->data[i];
-        bool seen = false;
-        for (size_t k = 0; k < out->len; k++)
-            seen |= !strcmp(out->data[k], s->project);
-        if (!seen)
-            ch_vec_push(out, ch_strdup(s->project));
+        /* A worktree stands for the repository it was made from. */
+        char *project = git_in_worktree(a, s->project) ? git_worktree_origin(a, s->project) : ch_strdup(s->project);
+        bool seen = !s->code || !project || !*project;
+        for (size_t k = 0; k < out->len && !seen; k++)
+            seen = !strcmp(out->data[k], project);
+        if (seen)
+            free(project);
+        else
+            ch_vec_push(out, project);
     }
     ch_vec_free(sessions);
     return out;
 }
-static void add_to_project_menu(App *a) {
-    ChVec *projects = recent_projects(a, 10);
-    for (size_t i = 0; i < projects->len; i++) {
-        const char *path = projects->data[i];
-        char *name = ch_path_basename(path);
-        if (menu_item(a, "folder", name, NULL, !strcmp(path, a->project) ? "✓" : NULL, true, path)) {
-            if (!ch_file_is_dir(path))
-                app_notice(a, "Project folder is missing", path);
-            else
-                app_set_project(a, path, false);
-        }
-        free(name);
-    }
-    ch_vec_free(projects);
-}
-static void design_menu(App *a) {
-    menu_heading(a, "Project design guidelines");
-    const char *paths[] = {".chela/DESIGN.md", "DESIGN.md"};
-    int count = 0;
-    for (size_t i = 0; i < CH_N_ELEMENTS(paths); i++) {
-        char *full = ch_build_path(a->project, paths[i], NULL);
-        if (ch_file_is_regular(full)) {
-            if (menu_item(a, "document-open", paths[i], NULL, NULL, true, NULL))
-                attach_context(a, paths[i], "Design guidelines");
-            count++;
-        }
-        free(full);
-    }
-    if (!count)
-        menu_item(a, NULL, "No project design guide", NULL, NULL, false, NULL);
-    menu_separator(a);
-    if (menu_item(a, "document-open", "Add guidelines from file…", NULL, NULL, true, NULL))
-        app_attach_file(a);
-}
 static void attach_menu(App *a) {
-    if (menu_item(a, "document-open", "Add files or photos", NULL, "Ctrl+U", true,
-                  "This connection supports UTF-8 text files, up to 256 KiB; image input is not available"))
+    if (menu_item(a, "document-open", "Add files or photos", NULL, "Ctrl+U", true, "Or paste them, or drop them on the window"))
         app_attach_file(a);
-    menu_item(a, "camera", "Take a screenshot", NULL, NULL, false, "Image attachments are not supported by this connection");
-    if (!a->code && menu_sub_begin(a, "folder", "Add to project", NULL, true, NULL)) {
-        add_to_project_menu(a);
-        menu_sub_end(a);
-    }
-    menu_separator(a);
-    if (menu_sub_begin(a, "skills", "Skills", NULL, true, NULL)) {
+    if (!a->code)
+        return;
+    if (menu_item(a, "folder", "Add folder", NULL, NULL, !a->busy, "Let the agent work in another folder too"))
+        app_choose_folder(a);
+    if (*a->project && menu_sub_begin(a, "skills", "Skills", NULL, true, NULL)) {
         skills_menu(a);
         menu_sub_end(a);
     }
-    if (menu_sub_begin(a, "connectors", "Connectors", NULL, true, NULL)) {
-        extension_menu(a, false);
-        menu_sub_end(a);
-    }
-    if (!a->code && menu_sub_begin(a, "palette", "Design system", NULL, true, NULL)) {
-        design_menu(a);
-        menu_sub_end(a);
-    }
-    if (menu_sub_begin(a, "plugins", "Add plugins", NULL, true, NULL)) {
-        extension_menu(a, true);
-        menu_sub_end(a);
-    }
-    if (!a->code) {
-        menu_separator(a);
-        menu_item(a, "research", "Research", NULL, NULL, false, "Requires a research connector");
-        menu_item(a, "globe", "Web search", NULL, NULL, false, "Requires a web search connector");
-    }
 }
-static void voice_menu(App *a) {
-    if (menu_item(a, "microphone", "Dictate", NULL, "Ctrl+D", true, NULL))
-        dictate(a);
-    menu_item(a, "waveform", "Use voice mode", NULL, NULL, false, "Spoken replies are not available yet");
-    menu_separator(a);
-    if (menu_sub_begin(a, "preferences-system", "Microphone", NULL, true, NULL)) {
-        menu_item(a, "microphone", "Transcription app default", NULL, "✓", false, NULL);
-        menu_sub_end(a);
+/* Another folder in the session, with the way to take it out again. */
+static bool included_row(App *a, size_t index) {
+    Cu *cu = a->cu;
+    const char *path = a->folders.data[index];
+    char *name = ch_path_basename(path);
+    cu_open(cu, cu_idn(cu, "included-folder", (int64_t)index),
+            &(CuBox){.row = true, .gap = 10, .w = CU_GROW, .align_y = CU_CENTER, .pad_l = 10, .pad_r = 6, .pad_t = 3, .pad_b = 3, .tooltip = path});
+    cu_text(cu, 0, name, &(CuTextStyle){.font = ui_font(a, 14, 400), .color = C_TEXT, .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
+    bool removed = ui_icon_button_sized(a, cu_idn(cu, "remove-folder", (int64_t)index), "window-close", 14, 3, "Remove from this session", !a->busy, false);
+    cu_close(cu);
+    free(name);
+    return removed;
+}
+/* The current branch, then the others, last committed first; a branch that is checked out
+ * in another worktree can't be switched to. The list scrolls: repositories can have hundreds. */
+static void branch_menu(App *a) {
+    Cu *cu = a->cu;
+    Menu *m = &a->menu;
+    menu_heading(a, "Switch branch");
+    CuId list = cu_id(cu, "branch-list");
+    /* Limited in width too: a menu as wide as a long name would open over the row it came from. */
+    cu_open(cu, list, &(CuBox){.w = CU_FIT_MAX(320), .h = CU_FIT_MAX(340), .scroll_y = true});
+    char *current = ch_strdup(a->git_branch);
+    menu_item(a, NULL, current, NULL, "✓", true, current);
+    size_t shown = 1, others = 0;
+    for (size_t i = 0; i < a->git_branches.len; i++) {
+        char *name = ch_strdup(a->git_branches.data[i]), *elsewhere = strchr(name, '\t');
+        if (elsewhere)
+            *elsewhere++ = 0;
+        if (strcmp(name, current) && shown++ < MENU_ITEMS - 1) {
+            bool free_to_use = !elsewhere || !*elsewhere;
+            char *tooltip = free_to_use ? ch_strdup(name) : ch_strconcat("Checked out in ", elsewhere, NULL);
+            if (menu_item(a, NULL, name, NULL, NULL, free_to_use, tooltip))
+                git_switch_branch(a, name);
+            free(tooltip);
+        } else if (strcmp(name, current))
+            others++;
+        free(name);
     }
-    menu_separator(a);
-    if (menu_item(a, NULL, "Voice settings…", NULL, NULL, true, NULL))
-        open_voice_settings(a);
+    free(current);
+    cu_close(cu);
+    if (others) {
+        char *more = ch_strdup_printf("%zu older branch%s", others, others == 1 ? "" : "es");
+        menu_item(a, NULL, more, NULL, NULL, false, NULL);
+        free(more);
+    }
+    /* The arrow keys can go past what the list shows. */
+    int cursor = m->cursor[m->level];
+    if (m->keyed && cursor >= 0) {
+        CuRect item = cu_rect(cu, cu_idn(cu, "#menu-item", m->level * 1000 + cursor)), view = cu_rect(cu, list);
+        if (item.y < view.y)
+            cu_scroll_by(cu, list, item.y - view.y);
+        else if (item.y + item.h > view.y + view.h)
+            cu_scroll_by(cu, list, item.y + item.h - view.y - view.h);
+    }
 }
 static void project_menu(App *a) {
-    menu_heading(a, "Project folder");
+    if (menu_item(a, NULL, "No folder", NULL, *a->project ? NULL : "✓", true, "Work without files") && !a->busy) {
+        app_set_project(a, "");
+        cu_focus(a->cu, cu_id(a->cu, "composer"));
+    }
     ChVec *projects = recent_projects(a, 7);
+    if (projects->len) {
+        menu_separator(a);
+        menu_heading(a, "Recent");
+    }
     for (size_t i = 0; i < projects->len; i++) {
         const char *path = projects->data[i];
         char *name = ch_path_basename(path);
-        if (menu_item(a, "folder", name, path, i == 0 ? "✓" : NULL, true, NULL) && !a->busy) {
+        bool current = !strcmp(path, a->project);
+        if (menu_item(a, NULL, name, NULL, current ? "✓" : NULL, true, path) && !a->busy) {
             if (!ch_file_is_dir(path))
                 app_notice(a, "Project folder is missing", path);
-            else if (strcmp(path, a->project))
-                app_set_project(a, path, true);
+            else if (!current)
+                app_set_project(a, path);
             cu_focus(a->cu, cu_id(a->cu, "composer"));
         }
         free(name);
     }
     ch_vec_free(projects);
     menu_separator(a);
-    if (menu_item(a, "folder", "Open folder…", NULL, NULL, true, NULL))
+    if (menu_item(a, "folder-open", "Open folder…", NULL, NULL, true, NULL))
         app_choose_project(a);
+    if (!*a->project)
+        return;
+    menu_separator(a);
+    menu_heading(a, "Also included");
+    size_t removed = SIZE_MAX;
+    for (size_t i = 0; i < a->folders.len; i++)
+        if (included_row(a, i))
+            removed = i;
+    if (removed != SIZE_MAX)
+        app_remove_folder(a, removed);
+    if (menu_item(a, "list-add", "Add folder…", NULL, NULL, !a->busy, "Let the agent work in another folder too"))
+        app_choose_folder(a);
+    if (!a->git_branch)
+        return;
+    menu_separator(a);
+    if (menu_sub_begin(a, "git-branch", "Branch", a->git_branch, !a->busy && !a->git_switching, "Switch branch")) {
+        branch_menu(a);
+        menu_sub_end(a);
+    }
 }
 static void environment_menu(App *a) {
     menu_heading(a, "Environment");
-    menu_item(a, "computer", "Local", "Project files and commands run on this computer", "✓", false, NULL);
+    menu_item(a, "computer", "This computer", "Project files and commands run here", "✓", false, NULL);
     menu_separator(a);
     if (menu_item(a, "network-server", "Model connection…", a->config.provider == 5 ? "External ACP harness" : a->config.endpoint,
                   NULL, true, NULL))
@@ -477,10 +566,56 @@ static void select_model(App *a, const char *id) {
         return;
     ChConfig config = a->config;
     ch_strlcpy(config.model, id, sizeof(config.model));
-    if (app_save_config(a, &config, "Could not select model")) {
-        app_set_status(a, "Model selected");
+    if (app_save_config(a, &config, "Could not select model"))
         model_tick(a);
+}
+static void select_effort(App *a, ChThinking level) {
+    if (a->busy)
+        return;
+    ChConfig config = a->config;
+    config.thinking = level;
+    app_save_config(a, &config, "Could not save effort");
+}
+/* Opens to the left: the model button sits at the right of the window. */
+static void effort_menu(App *a) {
+    Cu *cu = a->cu;
+    cu_open(cu, 0, &(CuBox){.w = CU_GROW, CU_PAD2(5, 10)});
+    ui_label_wrap(a, "More effort can help with hard tasks, but takes longer and shares your response limit.", 12, C_MUTED, 250);
+    cu_close(cu);
+    ChThinking current = ch_thinking_effective(&a->config);
+    bool always_reasons = ch_model_is_gpt_oss(&a->config);
+    for (int level = CH_THINK_DEFAULT; level <= CH_THINK_DEEP; level++) {
+        if (level == CH_THINK_OFF && always_reasons)
+            continue;
+        if (menu_item(a, NULL, ch_thinking_name((ChThinking)level), NULL, (int)current == level ? "✓" : NULL, true, NULL))
+            select_effort(a, (ChThinking)level);
     }
+}
+/* Rows are names alone. A line under one is for what stops it being used, or to tell
+ * it from a model that shortens to the same name. */
+static char *model_note(json_object *models, json_object *model) {
+    json_object *status = ch_json_get(model, "status"), *failed = ch_json_get(status, "failed");
+    if ((failed && json_object_get_boolean(failed)) || !strcmp(ch_json_str(status, "value"), "loading"))
+        return ch_strdup(ch_model_detail(model));
+    const char *id = ch_json_str(model, "id");
+    char *family = ch_model_family_name(id);
+    bool shared = false;
+    for (size_t i = 0; i < json_object_array_length(models) && !shared; i++) {
+        const char *other = ch_json_str(json_object_array_get_idx(models, i), "id");
+        char *name = ch_model_family_name(other);
+        shared = strcmp(other, id) && !strcmp(name, family);
+        free(name);
+    }
+    free(family);
+    return shared ? ch_model_short_name(id) : NULL;
+}
+static void model_row(App *a, json_object *models, json_object *model, const char *id, bool current) {
+    char *copy = ch_strdup(id), *name = ch_model_family_name(id), *note = model ? model_note(models, model) : NULL;
+    if (menu_item(a, NULL, name, note, current ? "✓" : NULL, true, copy))
+        select_model(a, copy);
+    free(copy);
+    free(name);
+    free(note);
 }
 static void model_menu(App *a) {
     if (a->config.ssh_enabled && !a->tunnel) {
@@ -500,106 +635,176 @@ static void model_menu(App *a) {
         return;
     }
     /* Choosing a model closes the menu, which frees its list while the loop below runs. */
-    json_object *models = a->menu.models ? json_object_get(a->menu.models) : NULL;
-    const char *current_detail = models ? "Current model" : providers[a->config.provider];
+    json_object *models = a->menu.models ? json_object_get(a->menu.models) : NULL, *selected = NULL;
     for (size_t i = 0; models && i < json_object_array_length(models); i++) {
         json_object *model = json_object_array_get_idx(models, i);
-        if (!strcmp(ch_json_str(model, "id"), a->config.model) && ch_model_detail(model))
-            current_detail = ch_model_detail(model);
+        if (!strcmp(ch_json_str(model, "id"), a->config.model))
+            selected = model;
     }
     char *current = ch_strdup(a->config.model);
-    if (menu_item(a, NULL, current, current_detail, "✓", true, current))
-        select_model(a, current);
+    model_row(a, models, selected, current, true);
     size_t count = 0;
     for (size_t i = 0; models && i < json_object_array_length(models); i++) {
         json_object *model = json_object_array_get_idx(models, i);
         const char *id = ch_json_str(model, "id");
         if (!*id || strlen(id) >= sizeof(a->config.model) || !strcmp(id, current))
             continue;
-        char *copy = ch_strdup(id);
-        if (menu_item(a, NULL, copy, ch_model_detail(model), NULL, true, copy))
-            select_model(a, copy);
-        free(copy);
+        model_row(a, models, model, id, false);
         count++;
     }
     free(current);
     json_object_put(models);
     if (a->menu.models_loading)
         menu_item(a, NULL, "Discovering models…", NULL, NULL, false, NULL);
-    menu_separator(a);
-    if (!a->menu.models_loading && (a->menu.models_error || !count))
-        menu_item(a, NULL, a->menu.models_error ? "Could not reach model server" : "No other models found",
-                  a->menu.models_error ? "Check your inference computer in Settings → Connections" : NULL, NULL, false,
-                  a->menu.models_error);
-    if (!a->menu.models_loading && model_chip_visible(a) &&
-        menu_item(a, "computer", "Model status…", "Device, memory, load time and keep loaded", "Ctrl+Shift+S", true, NULL))
-        menu_open(a, MENU_MODEL_PANEL, cu_id(a->cu, "model-chip"), true);
-    if (menu_item(a, "network-server", "Server diagnostics", "Status, device and recent server logs", "Ctrl+Shift+D", true, NULL))
-        open_diagnostics(a);
-    if (menu_item(a, "media-playback-start", "Test selected model", "Load the model and check a real response", NULL, true, NULL))
-        open_model_test(a);
-    if (menu_item(a, "network-server", "Manage connection…", "Connect or refresh an inference computer", NULL, true, NULL))
-        open_settings(a, 1);
+    else if (a->menu.models_error) {
+        menu_item(a, NULL, "Could not reach model server", "Check your inference computer", NULL, false, a->menu.models_error);
+        if (menu_item(a, "network-server", "Manage connection…", NULL, NULL, true, NULL))
+            open_settings(a, 1);
+    } else if (!count)
+        menu_item(a, NULL, "No other models found", NULL, NULL, false, NULL);
+    bool effort = ch_thinking_supported(&a->config), preload = model_control_supported(a);
+    if (effort || preload)
+        menu_separator(a);
+    if (effort && sub_begin(a, NULL, "Effort", ch_thinking_name(ch_thinking_effective(&a->config)), true, NULL, true)) {
+        effort_menu(a);
+        menu_sub_end(a);
+    }
+    if (preload && menu_switch(a, "Pre-load model", model_preload_hint(a), a->preload, model_preload_enabled(a)))
+        model_preload_set(a, !a->preload);
+}
+static void archive_one(App *a, const char *id) {
+    ChVec *ids = ch_vec_new(free);
+    ch_vec_push(ids, ch_strdup(id));
+    app_archive_sessions(a, ids);
+    ch_vec_free(ids);
 }
 static void session_menu(App *a) {
+    bool pinned = a->id && ch_map_has(&a->pinned, a->id);
+    if (menu_item(a, "pin", pinned ? "Unpin" : "Pin", NULL, NULL, a->id != NULL, NULL))
+        app_toggle_pin(a, a->id);
     if (menu_item(a, "document-edit", "Rename…", NULL, NULL, a->id != NULL, NULL))
         app_rename_session(a);
     if (menu_item(a, "document-save", "Export conversation…", NULL, NULL, a->id != NULL, NULL))
         app_export(a);
-    if (menu_item(a, "view-list", "View project changes", NULL, NULL, true, NULL))
-        app_show_changes(a);
-    menu_separator(a);
-    if (menu_sub_begin(a, "system-users", "Interaction", NULL, a->code, NULL)) {
-        interaction_menu(a);
-        menu_sub_end(a);
+    if (a->code) {
+        if (menu_item(a, "view-list", "View project changes", NULL, NULL, *a->project != 0, NULL))
+            app_show_changes(a);
+        menu_separator(a);
+        if (menu_sub_begin(a, "system-users", "Interaction", NULL, true, NULL)) {
+            interaction_menu(a);
+            menu_sub_end(a);
+        }
     }
     menu_separator(a);
+    if (menu_item(a, "archive", "Archive", NULL, NULL, a->id != NULL, NULL))
+        archive_one(a, a->id);
     if (menu_item_destructive(a, "user-trash", "Delete session…", NULL, a->id != NULL))
         app_delete_session(a);
 }
+/* Right clicking looks at a session rather than opening it. Only renaming and deleting
+ * need it on screen, and they open it when they are chosen. */
 static void row_menu(App *a) {
-    bool pinned = a->id && ch_map_has(&a->pinned, a->id);
-    if (menu_item(a, "pin", pinned ? "Unpin" : "Pin", NULL, "P", a->id != NULL, NULL))
-        app_toggle_pin(a);
-    if (menu_item(a, "document-edit", "Rename…", NULL, "R", true, NULL))
+    char *id = ch_strdup(a->menu.target);
+    bool pinned = ch_map_has(&a->pinned, id);
+    if (menu_item(a, "pin", pinned ? "Unpin" : "Pin", NULL, "P", true, NULL))
+        app_toggle_pin(a, id);
+    if (menu_item(a, "document-edit", "Rename…", NULL, "R", !a->busy, NULL)) {
+        app_select_session(a, id);
         app_rename_session(a);
-    menu_item(a, "folder", "Add to project", NULL, NULL, false, "The session uses its selected project folder");
+    }
     if (menu_sub_begin(a, NULL, "Move to", NULL, true, NULL)) {
         if (menu_item(a, NULL, "Recents", NULL, NULL, true, NULL))
-            app_move_to_section(a, NULL);
-        const char *current = a->id ? ch_map_get(&a->session_sections, a->id) : NULL;
+            app_move_to_section(a, id, NULL);
+        const char *current = ch_map_get(&a->session_sections, id);
         for (size_t i = 0; i < a->sections.len; i++) {
             const char *name = a->sections.data[i];
             char *copy = ch_strdup(name);
             if (menu_item(a, NULL, copy, NULL, !ch_strcmp0(current, name) ? "✓" : NULL, true, NULL))
-                app_move_to_section(a, copy);
+                app_move_to_section(a, id, copy);
             free(copy);
         }
         menu_separator(a);
-        if (menu_item(a, "list-add", "New section…", NULL, NULL, true, NULL))
+        if (menu_item(a, "list-add", "New section…", NULL, NULL, !a->busy, NULL)) {
+            app_select_session(a, id);
             app_create_section(a, true);
+        }
         menu_sub_end(a);
     }
     menu_separator(a);
-    if (menu_item_destructive(a, "user-trash", "Delete…", "D", true))
+    if (menu_item(a, "archive", "Archive", NULL, "A", !a->busy, NULL))
+        archive_one(a, id);
+    if (menu_item_destructive(a, "user-trash", "Delete…", "D", !a->busy)) {
+        app_select_session(a, id);
         app_delete_session(a);
+    }
+    free(id);
+}
+/* A folder's heading in the sidebar. */
+static void group_menu(App *a) {
+    char *project = ch_strdup(a->menu.target), *name = *project ? ch_path_basename(project) : ch_strdup("No folder");
+    ChVec *groups = app_project_groups(a), *sessions = app_project_sessions(a, project);
+    size_t place = 0, count = sessions->len;
+    while (place < groups->len && strcmp(groups->data[place], project))
+        place++;
+    bool above = place > 0, below = place + 1 < groups->len;
+    if (menu_item(a, NULL, "New session", NULL, NULL, !a->busy, NULL)) {
+        if (!*project || ch_file_is_dir(project))
+            app_set_project(a, project);
+        else
+            app_notice(a, "Project folder is missing", project);
+    }
+    if (above || below)
+        menu_separator(a);
+    if (above && menu_item(a, NULL, "Move up", NULL, NULL, true, NULL))
+        app_move_project(a, project, -1);
+    if (below && menu_item(a, NULL, "Move down", NULL, NULL, true, NULL))
+        app_move_project(a, project, 1);
+    menu_separator(a);
+    if (menu_item(a, NULL, "Select all", NULL, NULL, true, "Then right click one of them to archive or delete them together"))
+        app_select_project(a, project);
+    menu_separator(a);
+    if (menu_item(a, NULL, "Collapse all", NULL, NULL, sidebar_can_fold(a, true), NULL))
+        sidebar_fold_all(a, true);
+    if (menu_item(a, NULL, "Expand all", NULL, NULL, sidebar_can_fold(a, false), NULL))
+        sidebar_fold_all(a, false);
+    menu_separator(a);
+    char *archive = ch_strdup_printf("Archive all (%zu)", count), *remove = ch_strdup_printf("Delete all sessions (%zu)", count);
+    if (menu_item(a, NULL, archive, NULL, NULL, !a->busy, NULL))
+        app_archive_sessions(a, sessions);
+    if (menu_item_destructive(a, NULL, remove, NULL, !a->busy))
+        app_delete_sessions(a, sessions, name);
+    free(archive);
+    free(remove);
+    ch_vec_free(groups);
+    ch_vec_free(sessions);
+    free(name);
+    free(project);
+}
+static void selection_menu(App *a) {
+    ChVec *ids = app_selected_sessions(a);
+    size_t count = ids->len;
+    char *archive = ch_strdup_printf("Archive %zu sessions", count), *remove = ch_strdup_printf("Delete %zu sessions…", count);
+    if (menu_item(a, "archive", archive, NULL, NULL, !a->busy, NULL))
+        app_archive_sessions(a, ids);
+    if (menu_item_destructive(a, "user-trash", remove, NULL, !a->busy))
+        app_delete_sessions(a, ids, NULL);
+    menu_separator(a);
+    if (menu_item(a, NULL, "Clear selection", NULL, "Esc", true, NULL))
+        app_clear_selection(a);
+    free(archive);
+    free(remove);
+    ch_vec_free(ids);
 }
 static void filter_apply(App *a, const char *option) {
     if (!strcmp(option, "project") || !strcmp(option, "date") || !strcmp(option, "none") || !strcmp(option, "environment")) {
         a->group_projects = !strcmp(option, "project");
         a->group_dates = !strcmp(option, "date");
         a->group_environment = !strcmp(option, "environment");
-    } else if (ch_str_has_prefix(option, "type:"))
-        a->filter_type = atoi(option + 5);
-    else if (ch_str_has_prefix(option, "days:"))
+    } else if (ch_str_has_prefix(option, "days:"))
         a->activity_days = atoi(option + 5);
-    else if (ch_str_has_prefix(option, "folder:")) {
-        free(a->filter_project);
-        a->filter_project = ch_strdup(option + 7);
-    } else if (!strcmp(option, "reset")) {
+    else if (!strcmp(option, "reset")) {
         a->group_projects = a->group_dates = a->group_environment = a->sort_titles = false;
-        a->filter_type = a->activity_days = 0;
-        ch_clear_pointer(&a->filter_project, free);
+        a->activity_days = 0;
     } else
         a->sort_titles = !strcmp(option, "title");
     prefs_save(a);
@@ -612,36 +817,6 @@ static void choice(App *a, const char *title, const char *option, bool selected)
     free(copy);
 }
 static void filter_menu(App *a) {
-    const char *types[] = {"All", "Chat", "Code"};
-    if (menu_sub_begin(a, NULL, "Type", types[a->filter_type], true, NULL)) {
-        for (int i = 0; i < 3; i++) {
-            char option[16];
-            snprintf(option, sizeof(option), "type:%d", i);
-            choice(a, types[i], option, a->filter_type == i);
-        }
-        menu_sub_end(a);
-    }
-    char *folder = a->filter_project && *a->filter_project ? ch_path_basename(a->filter_project) : ch_strdup("All");
-    if (menu_sub_begin(a, NULL, "Project", folder, true, NULL)) {
-        choice(a, "All projects", "folder:", !a->filter_project || !*a->filter_project);
-        ChVec *sessions = ch_store_list(a->store, "", NULL);
-        ChMap seen;
-        ch_map_init(&seen, NULL);
-        for (size_t i = 0; sessions && i < sessions->len; i++) {
-            ChSession *s = sessions->data[i];
-            if (ch_map_has(&seen, s->project))
-                continue;
-            ch_map_set(&seen, s->project, NULL);
-            char *name = ch_path_basename(s->project), *option = ch_strconcat("folder:", s->project, NULL);
-            choice(a, name, option, !ch_strcmp0(a->filter_project, s->project));
-            free(name);
-            free(option);
-        }
-        ch_map_clear(&seen);
-        ch_vec_free(sessions);
-        menu_sub_end(a);
-    }
-    free(folder);
     const char *activity[] = {"All time", "Today", "Last 7 days", "Last 30 days"};
     const int days[] = {0, 1, 7, 30};
     int current = a->activity_days == 1 ? 1 : a->activity_days == 7 ? 2 : a->activity_days == 30 ? 3 : 0;
@@ -654,10 +829,9 @@ static void filter_menu(App *a) {
         menu_sub_end(a);
     }
     menu_separator(a);
-    if (menu_sub_begin(a, NULL, "Group by", a->group_projects ? "Project" : a->group_dates ? "Date" : "None", true, NULL)) {
+    if (menu_sub_begin(a, NULL, "Group by", a->group_dates ? "Date" : "None", true, NULL)) {
         choice(a, "Date", "date", a->group_dates);
-        choice(a, "Project", "project", a->group_projects);
-        choice(a, "None", "none", !a->group_projects && !a->group_dates);
+        choice(a, "None", "none", !a->group_dates);
         menu_sub_end(a);
     }
     if (menu_sub_begin(a, NULL, "Sort by", a->sort_titles ? "Name" : "Last activity", true, NULL)) {
@@ -667,6 +841,9 @@ static void filter_menu(App *a) {
     }
     menu_separator(a);
     choice(a, "Reset to defaults", "reset", false);
+    menu_separator(a);
+    if (menu_item(a, NULL, "View all", NULL, NULL, true, NULL))
+        open_all_sessions(a);
 }
 static void organizer_menu(App *a) {
     if (menu_sub_begin(a, NULL, "Group by",
@@ -684,10 +861,6 @@ static void organizer_menu(App *a) {
         menu_sub_end(a);
     }
     if (menu_sub_begin(a, NULL, "Show", NULL, true, NULL)) {
-        choice(a, "All sessions", "type:0", !a->filter_type);
-        choice(a, "Chats", "type:1", a->filter_type == 1);
-        choice(a, "Code sessions", "type:2", a->filter_type == 2);
-        menu_separator(a);
         choice(a, "All time", "days:0", !a->activity_days);
         choice(a, "Last 7 days", "days:7", a->activity_days == 7);
         menu_sub_end(a);
@@ -715,27 +888,33 @@ static void profile_menu(App *a) {
 static void app_menu(App *a) {
     if (menu_item(a, "list-add", "New session", NULL, "Ctrl+N", !a->busy, NULL))
         app_start_new(a);
-    if (menu_item(a, "folder", "Open folder…", NULL, NULL, !a->busy, NULL))
+    if (menu_item(a, "folder-open", "Open folder…", NULL, NULL, !a->busy, NULL))
         app_choose_project(a);
     menu_separator(a);
     if (menu_item(a, "sidebar-show", "Toggle sidebar", NULL, "Ctrl+B", true, NULL))
         app_toggle_sidebar(a);
     if (menu_item(a, "preferences-system", "Settings…", NULL, "Ctrl+,", !a->busy, NULL))
         open_settings(a, 0);
-    if (menu_item(a, NULL, "Keyboard shortcuts", NULL, NULL, true, NULL))
+    if (menu_item(a, "input-keyboard", "Keyboard shortcuts", NULL, NULL, true, NULL))
         open_shortcuts(a);
     menu_separator(a);
-    if (menu_item(a, NULL, "About Chela", NULL, NULL, true, NULL))
+    if (menu_item(a, "help-about", "About Chela", NULL, NULL, true, NULL))
         open_about(a);
-    if (menu_item(a, NULL, "Quit", NULL, "Ctrl+Q", true, NULL))
+    if (menu_item(a, "application-exit", "Quit", NULL, "Ctrl+Q", true, NULL))
         app_quit(a);
 }
 static void more_menu(App *a) {
-    menu_item(a, "artifacts", "Artifacts", "Artifact previews are not available yet", NULL, false, NULL);
-    menu_item(a, "clock", "Scheduled", "Scheduled tasks are not available yet", NULL, false, NULL);
-    menu_separator(a);
-    if (menu_item(a, NULL, "Keyboard shortcuts", NULL, NULL, true, NULL))
+    if (menu_sub_begin(a, NULL, "Group and sort", NULL, true, NULL)) {
+        if (a->code)
+            organizer_menu(a);
+        else
+            filter_menu(a);
+        menu_sub_end(a);
+    }
+    if (menu_item(a, "input-keyboard", "Keyboard shortcuts", NULL, NULL, true, NULL))
         open_shortcuts(a);
+    if (menu_item(a, "help-about", "About Chela", NULL, NULL, true, NULL))
+        open_about(a);
 }
 void menu_build(App *a) {
     Menu *m = &a->menu;
@@ -750,21 +929,23 @@ void menu_build(App *a) {
     m->index[0] = 0;
     m->depth = 0;
     m->moved = cu_mouse_x(a->cu) != m->mouse_x || cu_mouse_y(a->cu) != m->mouse_y;
+    m->mouse_dx = cu_mouse_x(a->cu) - m->mouse_x;
     m->mouse_x = cu_mouse_x(a->cu);
     m->mouse_y = cu_mouse_y(a->cu);
-    layer_begin(a, m->anchor, CU_PLACE_BELOW, m->align_end, kind == MENU_FILTER ? 270 : kind == MENU_ORGANIZER ? 214 : 204);
+    layer_begin(a, m->anchor, m->at_pointer ? CU_PLACE_POINT : CU_PLACE_BELOW, m->align_end,
+                kind == MENU_FILTER ? 270 : kind == MENU_MODEL ? 240 : kind == MENU_ORGANIZER ? 214 : 204);
     CuId root = m->layer[0];
     switch (kind) {
     case MENU_APP: app_menu(a); break;
     case MENU_PROJECT: project_menu(a); break;
     case MENU_MODEL: model_menu(a); break;
     case MENU_MODE: mode_menu(a); break;
-    case MENU_THINKING: thinking_menu(a); break;
     case MENU_ATTACH: attach_menu(a); break;
-    case MENU_VOICE: voice_menu(a); break;
     case MENU_ENVIRONMENT: environment_menu(a); break;
     case MENU_SESSION: session_menu(a); break;
     case MENU_ROW: row_menu(a); break;
+    case MENU_GROUP: group_menu(a); break;
+    case MENU_SELECTION: selection_menu(a); break;
     case MENU_FILTER: filter_menu(a); break;
     case MENU_ORGANIZER: organizer_menu(a); break;
     case MENU_PROFILE: profile_menu(a); break;
@@ -773,6 +954,7 @@ void menu_build(App *a) {
     }
     m->count[0] = m->index[0];
     m->activate_level = -1;
+    m->keyed = false;
     cu_layer_close(a->cu);
     if (a->menu.kind == kind && cu_layer_dismissed(a->cu, root))
         menu_close(a);

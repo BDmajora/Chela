@@ -34,6 +34,20 @@ static void copy_metric(json_object *to, const char *key, json_object *from, con
         json_object_get_double(value) >= 0 && json_object_get_double(value) < 1e12)
         json_object_object_add(to, key, json_object_get(value));
 }
+/* Two refusals have a next step that the server's wording leaves out; NULL for any other error. */
+static char *refusal_advice(const ChConfig *config, json_object *e) {
+    if (strstr(ch_json_str(e, "message"), "image input is not supported"))
+        return ch_strconcat("This model can't read images yet. ", ch_vision_help(config), NULL);
+    if (strcmp(ch_json_str(e, "type"), "exceed_context_size_error"))
+        return NULL;
+    long long needed = json_object_get_int64(ch_json_get(e, "n_prompt_tokens")), limit = json_object_get_int64(ch_json_get(e, "n_ctx"));
+    char *need = ch_format_count(needed), *room = ch_format_count(limit);
+    char *text = ch_strdup_printf("This conversation no longer fits: it needs %s tokens and the model has room for %s. "
+                                  "Start a new session, or raise Context tokens in Settings → Connections.", need, room);
+    free(need);
+    free(room);
+    return text;
+}
 static bool consume(const char *data, void *user, ChError **error) {
     Response *r = user;
     json_object *o = ch_json_parse(data, error);
@@ -41,7 +55,12 @@ static bool consume(const char *data, void *user, ChError **error) {
         return false;
     json_object *e = ch_json_get(o, "error");
     if (e) {
-        ch_fail(error, "Server: %s", ch_json_str(e, "message"));
+        char *advice = refusal_advice(&r->run->config, e);
+        if (advice)
+            ch_fail_literal(error, advice);
+        else
+            ch_fail(error, "Server: %s", ch_json_str(e, "message"));
+        free(advice);
         json_object_put(o);
         return false;
     }
@@ -262,8 +281,13 @@ static bool request(ChRun *run, const char *route, json_object *payload, Respons
     } else if (status < 200 || status >= 300) {
         json_object *o = ch_json_parse(r->raw->str, NULL);
         const char *m = ch_json_str(ch_json_get(o, "error"), "message");
-        ch_set_error(error, CH_ERR_HTTP, (int)status, "HTTP %ld%s%.500s", status,
-                    *m ? ": " : " — check the server URL, model, and API key", m);
+        char *advice = refusal_advice(&run->config, ch_json_get(o, "error"));
+        if (advice)
+            ch_set_error_literal(error, CH_ERR_HTTP, (int)status, advice);
+        else
+            ch_set_error(error, CH_ERR_HTTP, (int)status, "HTTP %ld%s%.500s", status,
+                         *m ? ": " : " — check the server URL, model, and API key", m);
+        free(advice);
         if (o)
             json_object_put(o);
         ok = false;
@@ -301,16 +325,10 @@ json_object *ch_complete(ChRun *run, json_object *messages, ChError **error) {
     report_stats(&r, false);
     json_object *p = json_object_new_object();
     json_object_object_add(p, "model", json_object_new_string(run->config.model));
-    /* Desktop performance metadata is stored with messages, never sent to a model. */
+    /* Desktop metadata is stored with messages, never sent to a model; attachments are read in here. */
     json_object *wire = json_object_new_array();
-    for (size_t i = 0; i < json_object_array_length(messages); i++) {
-        json_object *message = json_object_array_get_idx(messages, i), *copy = json_object_new_object();
-        json_object_object_foreach(message, key, value) {
-            if (strcmp(key, "_chela_stats"))
-                json_object_object_add(copy, key, json_object_get(value));
-        }
-        json_object_array_add(wire, copy);
-    }
+    for (size_t i = 0; i < json_object_array_length(messages); i++)
+        json_object_array_add(wire, ch_wire_message(json_object_array_get_idx(messages, i), !run->text_only));
     json_object_object_add(p, "messages", wire);
     json_object_object_add(p, "stream", json_object_new_boolean(true));
     json_object_object_add(p, "max_tokens", json_object_new_int(run->config.max_tokens));
@@ -338,7 +356,7 @@ json_object *ch_complete(ChRun *run, json_object *messages, ChError **error) {
                 json_object_new_int(CH_MIN(budgets[thinking], run->config.max_tokens / 2)));
         }
     }
-    if (run->config.tools)
+    if (ch_run_has_tools(run))
         json_object_object_add(p, "tools", ch_tool_schemas(ch_run_read_only(run) ? CH_PLAN : run->mode));
     bool ok = request(run, "chat/completions", p, &r, error);
     json_object_put(p);
@@ -413,6 +431,24 @@ json_object *ch_models(const ChConfig *config, const ChCancel *cancel, ChError *
         if (o)
             json_object_put(o);
     }
+    response_clear(&r);
+    return out;
+}
+/* /props beside the API. autoload=false: asking about a model must never load it. */
+json_object *ch_model_props(const ChConfig *config, const ChCancel *cancel, ChError **error) {
+    ChRun run = {.config = *config, .cancel = (ChCancel *)cancel};
+    Response r;
+    response_init(&r, &run);
+    json_object *out = NULL;
+    CURL *curl = curl_easy_init();
+    char *model = curl ? curl_easy_escape(curl, config->model, 0) : NULL;
+    char *route = ch_strdup_printf("/props?model=%s&autoload=false", model ? model : "");
+    if (request(&run, route, NULL, &r, error))
+        out = ch_json_parse(r.raw->str, error);
+    free(route);
+    curl_free(model);
+    if (curl)
+        curl_easy_cleanup(curl);
     response_clear(&r);
     return out;
 }

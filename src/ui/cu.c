@@ -1,5 +1,6 @@
 /* Chela UI core: frame lifecycle, input routing, flex layout, layers and painting. */
 #include "cu_internal.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,6 +141,10 @@ static void state_collect(Cu *cu) {
     free(old);
 }
 
+static void retired_free(void *layout) {
+    text_layout_free(layout);
+}
+
 /* Context */
 Cu *cu_new(const CuPlatform *platform, CuWindow *window) {
     Cu *cu = ch_new0(Cu, 1);
@@ -148,10 +153,13 @@ Cu *cu_new(const CuPlatform *platform, CuWindow *window) {
     ch_vec_init(&cu->chunks, free);
     ch_vec_init(&cu->layers, NULL);
     ch_vec_init(&cu->events, free);
+    ch_vec_init(&cu->payloads, NULL);
+    ch_vec_init(&cu->retired, retired_free);
     ch_buf_init(&cu->typed);
     cu->mouse_x = cu->mouse_y = -1;
     cu->window_active = true;
     cu->alpha = 1;
+    cu->sel_first = cu->sel_last = -1;
     return cu;
 }
 void cu_free(Cu *cu) {
@@ -165,15 +173,23 @@ void cu_free(Cu *cu) {
             free(cu->states[i]);
         }
     free(cu->states);
+    ch_vec_clear(&cu->retired);
     arena_reset(cu);
     ch_vec_clear(&cu->chunks);
     ch_vec_clear(&cu->layers);
+    for (size_t i = 0; i < cu->payloads.len; i++) {
+        cu_payload_clear(cu->payloads.data[i]);
+        free(cu->payloads.data[i]);
+    }
+    ch_vec_clear(&cu->payloads);
+    free(cu->link_clicked);
     ch_vec_clear(&cu->events);
     ch_buf_clear(&cu->typed);
     free(cu->hits);
     free(cu->next_hits);
     free(cu->widths);
     free(cu->sel_text);
+    free(cu->selectables);
     free(cu->tip_text);
     free(cu->preedit);
     free(cu);
@@ -379,8 +395,11 @@ static void update_hover(Cu *cu) {
         cursor = h->cursor;
     else if (h && h->edit)
         cursor = CU_CURSOR_TEXT;
-    else if (!h && any && any->selectable)
-        cursor = CU_CURSOR_TEXT;
+    else if (!h && any && any->selectable) {
+        State *s = cu_state_find(cu, any->id);
+        bool link = s && s->layout && text_layout_link(cu, s->layout, cu->mouse_x - s->rect.x, cu->mouse_y - s->rect.y);
+        cursor = link ? CU_CURSOR_POINTER : CU_CURSOR_TEXT;
+    }
     if (cursor != cu->cursor && cu->p->window_set_cursor) {
         cu->cursor = cursor;
         cu->p->window_set_cursor(cu->window, cursor);
@@ -388,8 +407,48 @@ static void update_hover(Cu *cu) {
 }
 
 /* Input */
+void cu_payload_push(Cu *cu, const char *mime, const void *data, size_t size, bool dropped) {
+    CuPayload *p = ch_new0(CuPayload, 1);
+    p->mime = ch_strdup(mime);
+    p->data = ch_alloc(size + 1);
+    memcpy(p->data, data, size);
+    p->data[size] = 0;
+    p->size = size;
+    p->dropped = dropped;
+    ch_vec_push(&cu->payloads, p);
+    cu_invalidate(cu);
+}
+bool cu_payload_take(Cu *cu, CuPayload *payload) {
+    if (!cu->payloads.len)
+        return false;
+    CuPayload *p = ch_vec_steal(&cu->payloads, 0);
+    *payload = *p;
+    free(p);
+    return true;
+}
+void cu_payload_clear(CuPayload *payload) {
+    free(payload->mime);
+    free(payload->data);
+    memset(payload, 0, sizeof(*payload));
+}
+bool cu_drag_active(Cu *cu) {
+    return cu->drag_over;
+}
+char *cu_link_take(Cu *cu) {
+    return ch_steal(&cu->link_clicked);
+}
 void cu_handle_event(Cu *cu, const CuEvent *event) {
     switch (event->type) {
+    case CU_EV_DRAG:
+        cu->drag_over = event->focused;
+        cu_invalidate(cu);
+        return;
+    case CU_EV_DROP:
+        cu->drag_over = false;
+        if (event->mime && event->data)
+            cu_payload_push(cu, event->mime, event->data, event->size, true);
+        cu_invalidate(cu);
+        return;
     case CU_EV_MOTION:
         cu->mouse_x = event->x;
         cu->mouse_y = event->y;
@@ -449,8 +508,160 @@ static void dismiss(Cu *cu, CuId id) {
     if (cu->dismissed_count < (int)CH_N_ELEMENTS(cu->dismissed))
         cu->dismissed[cu->dismissed_count++] = id;
 }
+/* Read-only selection. Elements come from the last frame, in reading order. */
+static bool same_group(const Selectable *e, int layer, CuId scroller) {
+    return e->layer == layer && e->scroller == scroller;
+}
+/* The place in a group nearest to a point. Lines matter more than columns, so moving
+ * past the end of a paragraph selects to its end instead of jumping to its neighbour. */
+static bool selection_point(Cu *cu, int layer, CuId scroller, float x, float y, CuId *id, size_t *offset) {
+    State *best = NULL;
+    float best_score = INFINITY;
+    for (int i = 0; i < cu->selectable_count; i++) {
+        const Selectable *e = &cu->selectables[i];
+        State *s = same_group(e, layer, scroller) ? cu_state_find(cu, e->id) : NULL;
+        if (!s || !s->layout)
+            continue;
+        float dx = x < s->rect.x ? s->rect.x - x : x > s->rect.x + s->rect.w ? x - s->rect.x - s->rect.w : 0;
+        float dy = y < s->rect.y ? s->rect.y - y : y >= s->rect.y + s->rect.h ? y - s->rect.y - s->rect.h : 0;
+        float score = dy * 4096 + dx;
+        if (score < best_score) {
+            best_score = score;
+            best = s;
+        }
+    }
+    if (!best)
+        return false;
+    *id = best->id;
+    if (y < best->rect.y)
+        *offset = 0;
+    else if (y >= best->rect.y + best->rect.h)
+        *offset = best->layout->length;
+    else
+        *offset = text_layout_hit(cu, best->layout, x - best->rect.x, y - best->rect.y);
+    return true;
+}
+static void selection_clear(Cu *cu) {
+    cu->sel_anchor_id = cu->sel_caret_id = 0;
+    cu->sel_first = cu->sel_last = -1;
+    cu->sel_focus = false;
+}
+static void selection_press(Cu *cu, Hit *text, float x, float y, int mods) {
+    Hit *area = hit_at(cu, x, y, FIND_SCROLL);
+    int layer = text ? text->layer : area ? area->layer : 0;
+    CuId scroller = area ? area->id : 0, id = 0;
+    size_t offset = 0;
+    /* Text in a scrolling area can be reached from the margins around it. */
+    if ((!text && !area) || !selection_point(cu, layer, scroller, x, y, &id, &offset)) {
+        selection_clear(cu);
+        return;
+    }
+    State *s = cu_state_find(cu, id);
+    bool extend = (mods & CU_MOD_SHIFT) && cu->sel_anchor_id && cu->sel_layer == layer && cu->sel_scroller == scroller;
+    cu->sel_layer = layer;
+    cu->sel_scroller = scroller;
+    cu->sel_focus = true;
+    cu->drag_sel = true;
+    if (cu->click_count >= 3) {
+        cu->sel_anchor_id = cu->sel_caret_id = id;
+        cu->sel_anchor = 0;
+        cu->sel_caret = s->layout->length;
+    } else if (cu->click_count == 2) {
+        cu->sel_anchor_id = cu->sel_caret_id = id;
+        cu->sel_anchor = text_word_start(s->layout->text, offset);
+        cu->sel_caret = text_word_end(s->layout->text, s->layout->length, offset);
+    } else {
+        if (!extend) {
+            cu->sel_anchor_id = id;
+            cu->sel_anchor = offset;
+        }
+        cu->sel_caret_id = id;
+        cu->sel_caret = offset;
+    }
+}
+/* While dragging, the caret follows the pointer and the text scrolls under it near the edges. */
+static void selection_drag(Cu *cu) {
+    float x = cu->mouse_x, y = cu->mouse_y;
+    State *area = cu->sel_scroller ? cu_state_find(cu, cu->sel_scroller) : NULL;
+    if (area) {
+        float top = area->rect.y, bottom = top + area->rect.h, margin = 10;
+        float over = y < top + margin ? y - top - margin : y > bottom - margin ? y - bottom + margin : 0;
+        if (over && area->scroll_max > 0) {
+            cu_scroll_by(cu, area->id, CH_CLAMP(over * 0.5f, -40.0f, 40.0f));
+            cu_animate(cu, 16);
+        }
+        y = CH_CLAMP(y, top, bottom - 1);
+    }
+    CuId id;
+    size_t offset;
+    if (selection_point(cu, cu->sel_layer, cu->sel_scroller, x, y, &id, &offset)) {
+        cu->sel_caret_id = id;
+        cu->sel_caret = offset;
+    }
+}
+/* Places the selection among this frame's elements; it ends when its text has gone. */
+static void selection_resolve(Cu *cu) {
+    cu->sel_first = cu->sel_last = -1;
+    if (!cu->sel_anchor_id)
+        return;
+    int anchor = -1, caret = -1;
+    for (int i = 0; i < cu->selectable_count; i++) {
+        if (cu->selectables[i].id == cu->sel_anchor_id)
+            anchor = i;
+        if (cu->selectables[i].id == cu->sel_caret_id)
+            caret = i;
+    }
+    if (anchor < 0 || caret < 0) {
+        selection_clear(cu);
+        return;
+    }
+    bool forward = anchor < caret || (anchor == caret && cu->sel_anchor <= cu->sel_caret);
+    cu->sel_first = forward ? anchor : caret;
+    cu->sel_last = forward ? caret : anchor;
+    cu->sel_start = forward ? cu->sel_anchor : cu->sel_caret;
+    cu->sel_end = forward ? cu->sel_caret : cu->sel_anchor;
+}
+/* What Ctrl+A selects: the text last clicked, or else the largest body of text on top. */
+static void select_all(Cu *cu) {
+    int top = -1, count = 0, floor = modal_floor(cu);
+    CuId scroller = 0;
+    for (int i = 0; i < cu->selectable_count; i++)
+        if (cu->selectables[i].layer >= floor)
+            top = CH_MAX(top, cu->selectables[i].layer);
+    if (cu->sel_focus && cu->sel_layer == top)
+        scroller = cu->sel_scroller;
+    else
+        for (int i = 0; i < cu->selectable_count; i++) {
+            const Selectable *e = &cu->selectables[i];
+            int same = 0;
+            for (int k = 0; e->layer == top && k < cu->selectable_count; k++)
+                same += same_group(&cu->selectables[k], top, e->scroller);
+            if (same > count) {
+                count = same;
+                scroller = e->scroller;
+            }
+        }
+    int first = -1, last = -1;
+    for (int i = 0; i < cu->selectable_count; i++)
+        if (same_group(&cu->selectables[i], top, scroller)) {
+            if (first < 0)
+                first = i;
+            last = i;
+        }
+    State *end = last >= 0 ? cu_state_find(cu, cu->selectables[last].id) : NULL;
+    if (!end || !end->layout)
+        return;
+    cu->sel_layer = top;
+    cu->sel_scroller = scroller;
+    cu->sel_anchor_id = cu->selectables[first].id;
+    cu->sel_caret_id = cu->selectables[last].id;
+    cu->sel_anchor = 0;
+    cu->sel_caret = end->layout->length;
+    cu->sel_focus = true;
+}
 static void press(Cu *cu, const CuEvent *ev) {
     float x = ev->x, y = ev->y;
+    cu->mods = ev->mods;
     cu->mouse_down = ev->button == 1;
     /* A click answers the tooltip's question; keep it hidden until the pointer moves on. */
     if (cu->tip_id || cu->hot)
@@ -483,15 +694,20 @@ static void press(Cu *cu, const CuEvent *ev) {
         cu->mouse_down = false;
         return;
     }
-    Hit *h = hit_at(cu, x, y, FIND_INTERACTIVE);
+    Hit *h = hit_at(cu, x, y, FIND_INTERACTIVE), *text = h ? NULL : hit_at(cu, x, y, FIND_SELECTABLE);
     cu->pressed = h ? h->id : 0;
+    /* Repeated clicks count on buttons, fields and text alike. */
+    CuId clicked = h ? h->id : text ? text->id : 0;
     int64_t now = ch_monotonic_us();
-    if (h && h->id == cu->last_click && now - cu->last_click_time < 400000)
+    if (clicked && clicked == cu->last_click && now - cu->last_click_time < 400000 &&
+        fabsf(x - cu->last_click_x) < 5 && fabsf(y - cu->last_click_y) < 5)
         cu->click_count++;
     else
         cu->click_count = 1;
-    cu->last_click = h ? h->id : 0;
+    cu->last_click = clicked;
     cu->last_click_time = now;
+    cu->last_click_x = x;
+    cu->last_click_y = y;
     if (ev->button == 3) {
         cu->right_clicked = h ? h->id : 0;
         cu->pressed = 0;
@@ -511,14 +727,15 @@ static void press(Cu *cu, const CuEvent *ev) {
         cu->mouse_down = false;
         return;
     }
-    if (h && h->scroll) {
+    Hit *area = h ? NULL : hit_at(cu, x, y, FIND_SCROLL);
+    if (area) {
         /* Scrollbar thumb */
-        State *s = cu_state_find(cu, h->id);
-        if (s && s->scroll_max > 0 && x >= h->rect.x + h->rect.w - 10) {
-            cu->drag_scrollbar = h->id;
-            float track = h->rect.h, thumb = fmaxf(28, track * track / (track + s->scroll_max));
+        State *s = cu_state_find(cu, area->id);
+        if (s && s->scroll_max > 0 && x >= area->rect.x + area->rect.w - 10) {
+            cu->drag_scrollbar = area->id;
+            float track = area->rect.h, thumb = fmaxf(28, track * track / (track + s->scroll_max));
             float pos = (s->scroll / s->scroll_max) * (track - thumb);
-            float in = y - h->rect.y;
+            float in = y - area->rect.y;
             cu->drag_offset = in >= pos && in <= pos + thumb ? in - pos : thumb / 2;
             cu->pressed = 0;
             return;
@@ -532,34 +749,28 @@ static void press(Cu *cu, const CuEvent *ev) {
             edit_pointer(cu, s->edit, s->rect, x, y, ev->mods & CU_MOD_SHIFT, cu->click_count);
             cu->drag_edit = h->id;
         }
-        cu->sel_id = 0;
+        selection_clear(cu);
         return;
     }
-    if (h && h->focusable) {
+    /* Pressing a button leaves a text box focused, so typing carries on where it was. */
+    State *field = h && h->focusable ? cu_state_find(cu, cu->focus) : NULL;
+    if (h && h->focusable && !(field && field->edit)) {
         cu->focus = h->id;
         cu->focus_visible = false;
     }
-    Hit *text = hit_at(cu, x, y, FIND_SELECTABLE);
-    if (text && !h) {
-        State *s = cu_state_find(cu, text->id);
-        if (s && s->layout) {
-            size_t offset = text_layout_hit(cu, s->layout, x - s->rect.x, y - s->rect.y);
-            if (cu->click_count >= 2 && cu->sel_id == text->id) {
-                cu->sel_anchor = text_word_start(s->layout->text, offset);
-                cu->sel_caret = text_word_end(s->layout->text, s->layout->length, offset);
-            } else {
-                if (!((ev->mods & CU_MOD_SHIFT) && cu->sel_id == text->id))
-                    cu->sel_anchor = offset;
-                cu->sel_caret = offset;
-                cu->sel_id = text->id;
-            }
-            cu->drag_sel = text->id;
-            cu->last_click = text->id;
-        }
-    } else if (!h)
-        cu->sel_id = 0;
+    if (!h)
+        selection_press(cu, text, x, y, ev->mods);
 }
 static void release(Cu *cu, const CuEvent *ev) {
+    if (ev->button == 1 && cu->drag_sel && cu->sel_anchor_id == cu->sel_caret_id && cu->sel_anchor == cu->sel_caret) {
+        /* A click on a link, not the start of a selection. */
+        State *s = cu_state_find(cu, cu->sel_caret_id);
+        const char *link = s && s->layout ? text_layout_link(cu, s->layout, ev->x - s->rect.x, ev->y - s->rect.y) : NULL;
+        if (link) {
+            free(cu->link_clicked);
+            cu->link_clicked = ch_strdup(link);
+        }
+    }
     if (ev->button == 1) {
         Hit *h = hit_at(cu, ev->x, ev->y, FIND_INTERACTIVE);
         if (cu->pressed && h && h->id == cu->pressed && !h->edit) {
@@ -573,23 +784,27 @@ static void release(Cu *cu, const CuEvent *ev) {
         }
         cu->pressed = 0;
         cu->mouse_down = false;
-        cu->drag_edit = cu->drag_sel = cu->drag_scrollbar = 0;
+        cu->drag_edit = cu->drag_scrollbar = 0;
+        cu->drag_sel = false;
     }
 }
 static void scroll(Cu *cu, const CuEvent *ev) {
+    /* A message box with more text than it shows scrolls first. */
+    Hit *field = hit_at(cu, ev->x, ev->y, FIND_INTERACTIVE);
+    State *fs = field && field->edit ? cu_state_find(cu, field->id) : NULL;
+    CuEdit *edit = fs ? fs->edit : NULL;
+    if (edit && edit->multiline && edit->layout) {
+        float max = ((TextLayout *)edit->layout)->h - fs->rect.h;
+        if (max > 0.5f) {
+            edit->scroll_y = CH_CLAMP(edit->scroll_y + ev->dy, 0, max);
+            edit->reveal_caret = false;
+            cu_invalidate(cu);
+            return;
+        }
+    }
     Hit *h = hit_at(cu, ev->x, ev->y, FIND_SCROLL);
-    if (!h)
-        return;
-    State *s = cu_state_find(cu, h->id);
-    if (!s)
-        return;
-    float base = s->scroll_pending ? s->scroll_target : s->scroll;
-    if (isinf(base))
-        base = s->scroll_max;
-    s->scroll_target = CH_CLAMP(base + ev->dy, 0, s->scroll_max);
-    s->scroll_pending = true;
-    if (cu->scrolled_count < (int)CH_N_ELEMENTS(cu->scrolled))
-        cu->scrolled[cu->scrolled_count++] = h->id;
+    if (h)
+        cu_scroll_by(cu, h->id, ev->dy);
 }
 static void key(Cu *cu, const CuEvent *ev) {
     cu->mods = ev->mods;
@@ -628,6 +843,7 @@ static void clear_keys(Cu *cu) {
     cu->key_count = 0;
 }
 static void process_input(Cu *cu) {
+    ch_clear_pointer(&cu->link_clicked, free);
     memset(cu->clicked, 0, sizeof(cu->clicked));
     cu->right_clicked = cu->double_clicked = 0;
     clear_keys(cu);
@@ -663,17 +879,14 @@ static void process_input(Cu *cu) {
     }
     ch_vec_clear(&cu->events);
     ch_vec_init(&cu->events, free);
-    /* Drags follow the pointer. */
-    if (cu->drag_edit) {
+    /* Drags follow the pointer; a double or triple click keeps the word or text it chose. */
+    if (cu->drag_edit && cu->click_count < 2) {
         State *s = cu_state_find(cu, cu->drag_edit);
         if (s && s->edit)
             edit_pointer(cu, s->edit, s->rect, cu->mouse_x, cu->mouse_y, true, 1);
     }
-    if (cu->drag_sel && cu->click_count < 2) {
-        State *s = cu_state_find(cu, cu->drag_sel);
-        if (s && s->layout)
-            cu->sel_caret = text_layout_hit(cu, s->layout, cu->mouse_x - s->rect.x, cu->mouse_y - s->rect.y);
-    }
+    if (cu->drag_sel && cu->click_count < 2)
+        selection_drag(cu);
     if (cu->drag_scrollbar) {
         State *s = cu_state_find(cu, cu->drag_scrollbar);
         if (s && s->scroll_max > 0) {
@@ -700,6 +913,19 @@ bool cu_key(Cu *cu, int key, int mods) {
 }
 bool cu_key_any(Cu *cu, int key) {
     return cu_consume_key(cu, key, 0, true);
+}
+bool cu_typed(Cu *cu, int ch) {
+    for (int i = 0; i < cu->key_count; i++) {
+        const char *text = cu->keys[i].text;
+        if (!cu->keys[i].consumed && cu->keys[i].key == -1 && text && tolower((unsigned char)text[0]) == ch && !text[1]) {
+            cu->keys[i].consumed = true;
+            return true;
+        }
+    }
+    return false;
+}
+int cu_mods(Cu *cu) {
+    return cu->mods;
 }
 
 /* Interaction queries */
@@ -749,6 +975,8 @@ bool cu_focus_visible(Cu *cu, CuId id) {
     return cu_focused(cu, id) && cu->focus_visible;
 }
 void cu_focus(Cu *cu, CuId id) {
+    if (id)
+        cu_state(cu, id); /* it may first be described in the next frame */
     if (cu->focus != id) {
         cu->focus = id;
         cu->focus_visible = false;
@@ -769,9 +997,31 @@ void cu_scroll_to(Cu *cu, CuId id, float y) {
     s->scroll_target = y;
     s->scroll_pending = true;
 }
+void cu_scroll_by(Cu *cu, CuId id, float dy) {
+    State *s = cu_state_find(cu, id);
+    if (!s)
+        return;
+    float base = s->scroll_pending ? s->scroll_target : s->scroll;
+    if (isinf(base))
+        base = s->scroll_max;
+    s->scroll_target = CH_CLAMP(base + dy, 0, s->scroll_max);
+    s->scroll_pending = true;
+    if (cu->scrolled_count < (int)CH_N_ELEMENTS(cu->scrolled))
+        cu->scrolled[cu->scrolled_count++] = id;
+    cu_invalidate(cu);
+}
 float cu_scroll_y(Cu *cu, CuId id) {
     State *s = cu_state_find(cu, id);
     return s ? s->scroll : 0;
+}
+float cu_scroll_target(Cu *cu, CuId id) {
+    (void)cu;
+    State *s = cu_state_find(cu, id);
+    if (!s)
+        return 0;
+    if (!s->scroll_pending)
+        return s->scroll;
+    return isinf(s->scroll_target) ? s->scroll_max : s->scroll_target;
 }
 float cu_scroll_max(Cu *cu, CuId id) {
     State *s = cu_state_find(cu, id);
@@ -797,17 +1047,40 @@ void cu_copy(Cu *cu, const char *text) {
         cu->p->clipboard_set(cu->window, text);
 }
 const char *cu_selection_text(Cu *cu) {
-    State *s = cu->sel_id ? cu_state_find(cu, cu->sel_id) : NULL;
-    if (!s || !s->layout || cu->sel_anchor == cu->sel_caret)
+    if (cu->sel_first < 0)
         return NULL;
-    size_t a = CH_MIN(cu->sel_anchor, cu->sel_caret), b = CH_MAX(cu->sel_anchor, cu->sel_caret);
-    b = CH_MIN(b, s->layout->length);
+    ChBuf out;
+    ch_buf_init(&out);
+    State *previous = NULL;
+    bool tight = false;
+    for (int i = cu->sel_first; i <= cu->sel_last; i++) {
+        if (!same_group(&cu->selectables[i], cu->sel_layer, cu->sel_scroller))
+            continue;
+        State *s = cu_state_find(cu, cu->selectables[i].id);
+        if (!s || !s->layout)
+            continue;
+        size_t from = i == cu->sel_first ? cu->sel_start : 0, to = i == cu->sel_last ? cu->sel_end : s->layout->length;
+        to = CH_MIN(to, s->layout->length);
+        from = CH_MIN(from, to);
+        /* Cells of a row part with a tab; blocks with the spacing they show. */
+        if (previous && out.len) {
+            float gap = s->rect.y - previous->rect.y - previous->layout->h;
+            bool close = gap <= 6 || (tight && cu->selectables[i].tight);
+            ch_buf_append(&out, s->rect.y < previous->rect.y + previous->rect.h - 1 ? "\t" : close ? "\n" : "\n\n");
+        }
+        ch_buf_append_len(&out, s->layout->text + from, to - from);
+        previous = s;
+        tight = cu->selectables[i].tight;
+    }
     free(cu->sel_text);
-    cu->sel_text = ch_strndup(s->layout->text + a, b - a);
-    return cu->sel_text;
+    cu->sel_text = ch_buf_steal(&out);
+    return *cu->sel_text ? cu->sel_text : NULL;
 }
 void cu_clear_selection(Cu *cu) {
-    cu->sel_id = 0;
+    selection_clear(cu);
+}
+bool cu_selecting(Cu *cu) {
+    return cu->drag_sel;
 }
 
 /* Tree construction */
@@ -860,7 +1133,9 @@ static void text_element(Cu *cu, CuId id, CuSpan *spans, int count, const CuText
         e->text.line_height = style->line_height;
         e->text.max_lines = style->max_lines;
         e->selectable = style->selectable;
-        e->box.w = style->w.kind || style->w.value ? style->w : style->wrap ? CU_GROW : CU_FIT;
+        /* CU_SIZE_FIT and an unset size are both zero: only the limits tell CU_FIT_MAX from "not given". */
+        bool sized = style->w.kind || style->w.value || style->w.min || style->w.max;
+        e->box.w = sized ? style->w : style->wrap ? CU_GROW : CU_FIT;
         if (style->max_width > 0 && !e->box.w.max)
             e->box.w.max = style->max_width;
     }
@@ -870,7 +1145,9 @@ static void text_element(Cu *cu, CuId id, CuSpan *spans, int count, const CuText
         e->text.hanging = para->hanging;
         e->text.line_height = para->line_height;
         e->text.preformatted = para->preformatted;
+        e->text.align = para->align;
         e->selectable = para->selectable;
+        e->tight = para->tight;
         e->box.w = CU_GROW;
         e->box.pad_b = para->space_after;
     }
@@ -899,6 +1176,7 @@ void cu_rich(Cu *cu, CuId id, const CuSpan *spans, int count, const CuPara *para
         size_t n = spans[i].length == SIZE_MAX ? strlen(spans[i].text) : spans[i].length;
         copy[i].text = cu_arena_strndup(cu, spans[i].text, n);
         copy[i].length = n;
+        copy[i].link = spans[i].link ? cu_arena_strndup(cu, spans[i].link, strlen(spans[i].link)) : NULL;
     }
     CuPara p = para ? *para : (CuPara){0};
     text_element(cu, id, copy, count, NULL, &p);
@@ -978,7 +1256,8 @@ static void layout_text(Cu *cu, El *e, float width) {
     }
     key = text_hash(key, &e->text, sizeof(e->text));
     if (!s->layout || s->layout->key != key || fabsf(s->layout->width_key - width) > 0.25f) {
-        text_layout_free(s->layout);
+        if (s->layout)
+            ch_vec_push(&cu->retired, s->layout);
         s->layout = text_layout_new(cu, e->spans, e->span_count, &e->text, width);
         s->layout->key = key;
         s->layout->width_key = width;
@@ -1251,6 +1530,17 @@ static void position(Cu *cu, El *e, float x, float y, CuRect clip) {
     s->rect = rect;
     CuRect visible = intersect(clip, rect);
     add_hit(cu, e, visible);
+    if (e->type == EL_TEXT && e->selectable && e->layout) {
+        for (El *p = e->parent; p && !e->scroller; p = p->parent)
+            if (p->box.scroll_y)
+                e->scroller = p->id;
+        if (cu->selectable_count == cu->selectable_cap) {
+            cu->selectable_cap = cu->selectable_cap ? cu->selectable_cap * 2 : 256;
+            cu->selectables = ch_realloc(cu->selectables, sizeof(Selectable) * (size_t)cu->selectable_cap);
+        }
+        cu->selectables[cu->selectable_count++] = (Selectable){e->id, e->scroller, e->layer, e->tight};
+        e->sel_index = cu->selectable_count;
+    }
     if (e->box.focusable && cu->focusable_count < (int)CH_N_ELEMENTS(cu->focusables)) {
         cu->focusable_layer[cu->focusable_count] = e->layer;
         cu->focusables[cu->focusable_count++] = e->id;
@@ -1330,11 +1620,15 @@ static void place_layer(Cu *cu, LayerRec *rec) {
         break;
     }
     case CU_PLACE_RIGHT:
-        x = a.x + a.w + l->offset;
-        y = l->align_end ? a.y + a.h - h : a.y - 5;
-        if (x + w > cu->width - margin)
-            x = a.x - w - l->offset;
+    case CU_PLACE_LEFT: {
+        float right_x = a.x + a.w + l->offset, left_x = a.x - w - l->offset;
+        bool left = l->placement == CU_PLACE_LEFT;
+        if (left ? left_x < margin : right_x + w > cu->width - margin)
+            left = !left;
+        x = left ? left_x : right_x;
+        y = l->align_end ? a.y + a.h - h + 5 : a.y - 5;
         break;
+    }
     case CU_PLACE_CENTER:
         x = (cu->width - w) / 2;
         y = (cu->height - h) / 2;
@@ -1383,6 +1677,11 @@ static void paint_el(Cu *cu, CuCanvas *c, El *e) {
         p->stroke_rect(c, (CuRect){r.x + b / 2, r.y + b / 2, r.w - b, r.h - b}, fmaxf(0, e->box.radius - b / 2), b,
                        cu_apply_alpha(cu, e->box.border_color));
     }
+    if (e->box.paint) {
+        p->save(c);
+        e->box.paint(cu, c, r, e->box.paint_data);
+        p->restore(c);
+    }
     CuColor rule = cu_apply_alpha(cu, e->box.border_color);
     if (e->box.border_b > 0)
         p->fill_rect(c, (CuRect){r.x, r.y + r.h - e->box.border_b, r.w, e->box.border_b}, 0, rule);
@@ -1390,13 +1689,17 @@ static void paint_el(Cu *cu, CuCanvas *c, El *e) {
         p->fill_rect(c, (CuRect){r.x, r.y, r.w, e->box.border_t}, 0, rule);
     if (e->box.border_r > 0)
         p->fill_rect(c, (CuRect){r.x + r.w - e->box.border_r, r.y, e->box.border_r, r.h}, 0, rule);
+    if (e->box.border_l > 0)
+        p->fill_rect(c, (CuRect){r.x, r.y, e->box.border_l, r.h}, e->box.border_l / 2, rule);
     switch (e->type) {
     case EL_TEXT:
         if (e->layout) {
             size_t a = 0, b = 0;
-            if (cu->sel_id == e->id) {
-                a = CH_MIN(cu->sel_anchor, cu->sel_caret);
-                b = CH_MAX(cu->sel_anchor, cu->sel_caret);
+            int index = e->sel_index - 1;
+            if (index >= 0 && index >= cu->sel_first && index <= cu->sel_last && e->layer == cu->sel_layer &&
+                e->scroller == cu->sel_scroller) {
+                a = index == cu->sel_first ? cu->sel_start : 0;
+                b = index == cu->sel_last ? cu->sel_end : e->layout->length;
             }
             text_layout_paint(cu, c, e->layout, r.x + e->box.pad_l, r.y + e->box.pad_t, a, b, 0x664a76c9);
         }
@@ -1456,7 +1759,9 @@ static void tooltip_layer(Cu *cu) {
     cu_layer_close(cu);
 }
 static void build_frame(Cu *cu) {
-    arena_reset(cu);
+    arena_reset(cu); /* the last tree is gone, and with it the last uses of retired layouts */
+    ch_vec_clear(&cu->retired);
+    ch_vec_init(&cu->retired, retired_free);
     ch_vec_clear(&cu->layers);
     ch_vec_init(&cu->layers, NULL);
     cu->depth = 0;
@@ -1476,6 +1781,11 @@ static void build_frame(Cu *cu) {
         cu->build(cu, cu->build_data);
     cu->depth = 1;
     tooltip_layer(cu);
+    /* Keys nothing else wanted act on read-only text, in dialogs as well as the transcript. */
+    if (cu_key(cu, 'a', CU_MOD_CTRL))
+        select_all(cu);
+    if (cu_key(cu, 'c', CU_MOD_CTRL) || cu_key(cu, CU_KEY_INSERT, CU_MOD_CTRL))
+        cu_copy(cu, cu_selection_text(cu));
     /* Unconsumed Tab moves keyboard focus among this frame's focusable elements. */
     cu->tab_dir = 0;
     for (int k = 0; k < cu->key_count; k++)
@@ -1488,6 +1798,7 @@ static void build_frame(Cu *cu) {
 static void finish_layout(Cu *cu) {
     cu->next_hit_count = 0;
     cu->focusable_count = 0;
+    cu->selectable_count = 0;
     layout_root(cu, cu->root, cu->width, cu->height, false);
     position(cu, cu->root, 0, 0, (CuRect){0, 0, cu->width, cu->height});
     cu->prev_layer_count = 0;
@@ -1501,6 +1812,13 @@ static void finish_layout(Cu *cu) {
             cu->prev_layer_kinds[n] = rec->layer.kind;
             cu->prev_layer_anchors[n] = rec->layer.anchor;
         }
+    }
+    selection_resolve(cu);
+    /* Focus does not outlive what held it, such as a field in a dialog that has closed. */
+    State *focused = cu->focus ? cu_state_find(cu, cu->focus) : NULL;
+    if (focused && cu->frame - focused->frame > 1) {
+        cu->focus = 0;
+        cu->invalid = true;
     }
     /* Keyboard focus traversal within the topmost modal layer. */
     int floor = 0;
@@ -1668,6 +1986,16 @@ bool cu_find_text(Cu *cu, const char *text, CuRect *rect) {
             El *e = find_in(root, text, exact);
             if (e) {
                 *rect = intersect((CuRect){e->x, e->y, e->w, e->h}, e->clip);
+                /* Within a paragraph, the words themselves rather than the whole block. */
+                const char *found = !exact && e->type == EL_TEXT && e->layout ? strstr(e->layout->text, text) : NULL;
+                if (found) {
+                    float x, y, h, end_x, end_y, end_h;
+                    size_t offset = (size_t)(found - e->layout->text);
+                    text_layout_caret(cu, e->layout, offset, &x, &y, &h);
+                    text_layout_caret(cu, e->layout, offset + strlen(text), &end_x, &end_y, &end_h);
+                    if (end_y == y && end_x > x)
+                        *rect = (CuRect){e->x + e->box.pad_l + x, e->y + e->box.pad_t + y, end_x - x, h};
+                }
                 return true;
             }
         }

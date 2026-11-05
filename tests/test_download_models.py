@@ -88,13 +88,32 @@ class DownloadTests(unittest.TestCase):
         names = ["Q8_0/Model-Q8_0-00001-of-00002.gguf", "Q8_0/Model-Q8_0-00002-of-00002.gguf",
                  "Model-Q4_K_M.gguf", "mtp-Model-Q8_0.gguf", "mmproj-Model-Q8_0.gguf", "Model-imatrix.gguf"]
         files = [File(n, 10) for n in names]
-        self.assertEqual([f.name for f in download.select_files(files, "gguf")], names[:2])
+        self.assertEqual([f.name for f in download.select_files(files, "gguf", vision=False)], names[:2])
+        self.assertEqual({f.name for f in download.select_files(files, "gguf")}, {*names[:2], names[4]})
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             download.select_files(files[:1], "gguf")
         with self.assertRaisesRegex(ValueError, "Multiple"):
             download.select_files(files + [File("Other-Q8_0.gguf", 10)], "gguf")
         with self.assertRaisesRegex(ValueError, "No main-model"):
             download.select_files(files, "gguf", quant="Q6_K")
+
+    def test_gguf_vision_file_is_the_nearest_widely_supported_one(self):
+        # The layout of the Qwen repository this project uses: quants in folders, one vision file at the top.
+        weights = ["IQ1_M/Qwen-IQ1_M-00001-of-00002.gguf", "IQ1_M/Qwen-IQ1_M-00002-of-00002.gguf"]
+        files = [File(n, 10) for n in weights + ["mmproj-Qwen-BF16.gguf", "IQ2_S/Qwen-IQ2_S.gguf"]]
+        chosen = {f.name for f in download.select_files(files, "gguf", quant="IQ1_M")}
+        self.assertEqual(chosen, {*weights, "mmproj-Qwen-BF16.gguf"})
+        # Of several precisions F16 wins, and one beside the weights beats one at the top.
+        names = ["Model-Q8_0.gguf", "mmproj-Model-F32.gguf", "mmproj-Model-BF16.gguf", "mmproj-Model-F16.gguf"]
+        self.assertIn("mmproj-Model-F16.gguf", [f.name for f in download.select_files([File(n, 10) for n in names], "gguf")])
+        names = ["Q8_0/Model-Q8_0.gguf", "mmproj-Model-F16.gguf", "Q8_0/mmproj.gguf"]
+        chosen = [f.name for f in download.select_files([File(n, 10) for n in names], "gguf")]
+        self.assertEqual(chosen, ["Q8_0/Model-Q8_0.gguf", "Q8_0/mmproj.gguf"])
+        # Another quant's folder is not this model's, and a vision file is never mistaken for the weights.
+        names = ["Q8_0/Model-Q8_0.gguf", "Q6_K/mmproj-Model-Q6_K.gguf"]
+        self.assertEqual([f.name for f in download.select_files([File(n, 10) for n in names], "gguf")], names[:1])
+        names = ["Model-Q8_0.gguf", "Model-Q8_0-mmproj.gguf"]
+        self.assertEqual({f.name for f in download.select_files([File(n, 10) for n in names], "gguf", gguf_glob="*Q8_0*")}, set(names))
 
     def test_hashes_and_storage_resume(self):
         with tempfile.TemporaryDirectory() as temp:

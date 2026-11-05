@@ -190,6 +190,29 @@ static int key_from(guint keyval) {
     guint32 c = gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval));
     return c >= 0x20 && c != 0x7f ? (int)c : 0;
 }
+static gboolean on_drag_motion(GtkWidget *widget, GdkDragContext *context, gint x, gint y, guint time, CuWindow *w) {
+    (void)widget, (void)context, (void)time;
+    CuEvent ev = {.type = CU_EV_DRAG, .focused = true, .x = (float)x, .y = (float)y};
+    w->handler->event(w, &ev, w->data);
+    return FALSE;
+}
+static void on_drag_leave(GtkWidget *widget, GdkDragContext *context, guint time, CuWindow *w) {
+    (void)widget, (void)context, (void)time;
+    CuEvent ev = {.type = CU_EV_DRAG, .focused = false};
+    w->handler->event(w, &ev, w->data);
+}
+static void on_drag_received(GtkWidget *widget, GdkDragContext *context, gint x, gint y, GtkSelectionData *selection,
+                             guint info, guint time, CuWindow *w) {
+    (void)widget, (void)context, (void)x, (void)y, (void)info, (void)time;
+    gint length = 0;
+    const guchar *bytes = gtk_selection_data_get_data_with_length(selection, &length);
+    char *mime = gdk_atom_name(gtk_selection_data_get_data_type(selection));
+    if (bytes && length > 0) {
+        CuEvent ev = {.type = CU_EV_DROP, .mime = mime, .data = bytes, .size = (size_t)length};
+        w->handler->event(w, &ev, w->data);
+    }
+    g_free(mime);
+}
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *ev, CuWindow *w) {
     (void)widget;
     if (w->preediting && gtk_im_context_filter_keypress(w->im, ev))
@@ -296,6 +319,12 @@ static CuWindow *window_new(const char *title, const char *app_id, int width, in
     g_signal_connect(w->area, "button-press-event", G_CALLBACK(on_button), w);
     g_signal_connect(w->area, "button-release-event", G_CALLBACK(on_button), w);
     g_signal_connect(w->area, "scroll-event", G_CALLBACK(on_scroll), w);
+    static const GtkTargetEntry drops[] = {{(char *)"text/uri-list", 0, 0}, {(char *)"image/png", 0, 1}, {(char *)"image/jpeg", 0, 2},
+                                           {(char *)"text/plain;charset=utf-8", 0, 3}, {(char *)"text/plain", 0, 4}};
+    gtk_drag_dest_set(w->area, GTK_DEST_DEFAULT_ALL, drops, G_N_ELEMENTS(drops), GDK_ACTION_COPY);
+    g_signal_connect(w->area, "drag-motion", G_CALLBACK(on_drag_motion), w);
+    g_signal_connect(w->area, "drag-leave", G_CALLBACK(on_drag_leave), w);
+    g_signal_connect(w->area, "drag-data-received", G_CALLBACK(on_drag_received), w);
     g_signal_connect(w->window, "key-press-event", G_CALLBACK(on_key_press), w);
     g_signal_connect(w->window, "key-release-event", G_CALLBACK(on_key_release), w);
     g_signal_connect(w->window, "focus-in-event", G_CALLBACK(on_focus), w);
@@ -444,6 +473,45 @@ static void clipboard_request(CuWindow *w, void (*callback)(const char *, void *
     gtk_clipboard_request_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), clipboard_received, r);
 }
 
+typedef struct {
+    void (*callback)(const char *, const void *, size_t, void *);
+    void *data;
+    char *mime;
+} DataRequest;
+static void data_received(GtkClipboard *clipboard, GtkSelectionData *selection, gpointer user) {
+    (void)clipboard;
+    DataRequest *r = user;
+    gint length = 0;
+    const guchar *bytes = gtk_selection_data_get_data_with_length(selection, &length);
+    r->callback(bytes && length > 0 ? r->mime : NULL, bytes, length > 0 ? (size_t)length : 0, r->data);
+    g_free(r->mime);
+    g_free(r);
+}
+static void targets_received(GtkClipboard *clipboard, GdkAtom *atoms, gint count, gpointer user) {
+    DataRequest *r = user;
+    const char **mimes = g_new0(const char *, (gsize)count + 1);
+    char **names = g_new0(char *, (gsize)count + 1);
+    for (gint i = 0; i < count; i++)
+        mimes[i] = names[i] = gdk_atom_name(atoms[i]);
+    int best = atoms ? ch_clipboard_best(mimes, count) : -1;
+    if (best < 0) {
+        r->callback(NULL, NULL, 0, r->data);
+        g_free(r);
+    } else {
+        r->mime = g_strdup(names[best]);
+        gtk_clipboard_request_contents(clipboard, atoms[best], data_received, r);
+    }
+    g_strfreev(names);
+    g_free(mimes);
+}
+static void clipboard_request_data(CuWindow *w, void (*callback)(const char *, const void *, size_t, void *), void *data) {
+    (void)w;
+    DataRequest *r = g_new0(DataRequest, 1);
+    r->callback = callback;
+    r->data = data;
+    gtk_clipboard_request_targets(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), targets_received, r);
+}
+
 /* Native file dialogs (the desktop portal when available) */
 static void file_response(GtkNativeDialog *dialog, gint response, gpointer data) {
     Request *r = data;
@@ -505,6 +573,7 @@ __attribute__((visibility("default"))) const CuPlatform *chela_platform(void) {
         p.timer_remove = timer_remove;
         p.clipboard_set = clipboard_set;
         p.clipboard_request = clipboard_request;
+        p.clipboard_request_data = clipboard_request_data;
         p.file_dialog = file_dialog;
         cc_install(&p);
     }

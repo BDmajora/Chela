@@ -31,7 +31,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path == '/props':
+            if self.path.startswith('/props'):
                 self.send_json({})
                 return
             assert self.path == '/v1/models', self.path
@@ -171,8 +171,9 @@ def main():
                 assert answer['_chela_stats']['tokens_per_second'] == 40, answer
                 assert answer['_chela_stats']['reasoning_tokens'] == 8, answer
                 assert answer['_chela_stats']['complete'] is True, answer
-                w.wait_visible('^Completed$')
-                assert count('40.0 tok/s') >= 2, w.texts()
+                w.wait_visible('^Reply$')
+                assert count('40.0 tok/s') == 1, w.texts()  # under the reply; the monitor has gone
+                assert not w.visible('Diagnostics'), w.texts()
                 w.shot('ui-monitor-completed.png')
                 assert server.requests[0]['timings_per_token'] is True
                 assert server.requests[0]['return_progress'] is True
@@ -180,11 +181,11 @@ def main():
 
                 submit('empty answer')
                 w.wait_visible('The model returned no answer or tool calls')
-                assert w.visible('Request failed') and w.visible('Retry message'), w.texts()
+                assert w.visible('Request stopped') and w.visible('Retry message'), w.texts()
                 w.shot('ui-monitor-empty-error.png')
                 w.tap('Retry message')
                 wait_for(lambda: saved_answer('Recovered successfully.'), what='the retried answer')
-                w.wait_visible('^Completed$')
+                w.wait_visible('^Reply$')
                 assert server.attempts['empty answer'] == 2
                 assert all('_chela_stats' not in message for request in server.requests
                            for message in request['messages']), server.requests
@@ -197,12 +198,12 @@ def main():
                 w.tap('Reply')
                 submit('disconnect')
                 w.wait_visible('Server closed an incomplete response')
-                assert w.visible('Request failed') and w.visible('Retry message')
+                assert w.visible('Request stopped') and w.visible('Retry message')
                 w.shot('ui-monitor-disconnected.png')
                 w.tap('Reply')
                 submit('http failure')
                 w.wait_visible('Fixture model process exited')
-                assert w.visible('Request failed') and w.visible('Retry message')
+                assert w.visible('Request stopped') and w.visible('Retry message')
                 w.shot('ui-monitor-http-error.png')
                 w.key('ctrl+shift+d')
                 w.wait_visible('Last request error: HTTP 503')

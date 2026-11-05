@@ -6,7 +6,7 @@ not assert that different conversation text, fonts, or every menu match pixels.
 import subprocess
 
 
-def measure_frame(path, executable, sidebar=True, prompt_height=44, column_limit=768):
+def measure_frame(path, executable, sidebar=True, prompt_height=44, column_limit=768, panel=0):
     width, height = map(int, subprocess.check_output(
         [executable("identify"), "-format", "%w %h", str(path)], text=True
     ).split())
@@ -23,7 +23,8 @@ def measure_frame(path, executable, sidebar=True, prompt_height=44, column_limit
         assert pixel(4, height // 2) == (31, 31, 31), "Sidebar palette drifted"
         assert pixel(278, height // 2) == (31, 31, 31), "Sidebar width drifted"
     assert pixel(sidebar_width + 8, height // 2) == (25, 25, 25), "Conversation palette drifted"
-    center_x = (sidebar_width + width) // 2
+    main_right = width - panel
+    center_x = (sidebar_width + main_right) // 2
     runs = []
     for y in range(height - 150, height):
         if pixel(center_x, y) == (48, 48, 48):
@@ -35,13 +36,13 @@ def measure_frame(path, executable, sidebar=True, prompt_height=44, column_limit
     run = max(runs, key=len)
     prompt_y = run[0] - 1
     scan_y = (run[0] + run[-1]) // 2
-    filled = [x for x in range(sidebar_width, width) if pixel(x, scan_y) == (48, 48, 48)]
+    filled = [x for x in range(sidebar_width, main_right) if pixel(x, scan_y) == (48, 48, 48)]
     prompt_x = min(filled) - 1
     measured_width = max(filled) - min(filled) + 3
     measured_height = len(run) + 2
-    expected_width = min(column_limit, width - sidebar_width - 64)
+    expected_width = min(column_limit, main_right - sidebar_width - 64)
     assert measured_width == expected_width, (path.name, "prompt width", measured_width, expected_width)
-    assert prompt_x == (width + sidebar_width - expected_width) // 2, (path.name, "prompt centering", prompt_x)
+    assert prompt_x == (main_right + sidebar_width - expected_width) // 2, (path.name, "prompt centering", prompt_x)
     assert measured_height == prompt_height, (path.name, "prompt height", measured_height, prompt_height)
     return {
         "window": [width, height], "sidebar_width": sidebar_width,

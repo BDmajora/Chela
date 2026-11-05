@@ -112,6 +112,29 @@ bool ui_checkbox(App *a, CuId id, const char *text, bool *value, bool enabled) {
     }
     return false;
 }
+/* The same, sized to sit in a row of flat buttons. */
+bool ui_flat_check(App *a, CuId id, const char *text, bool *value, float size, CuColor color, const char *tooltip,
+                   bool enabled) {
+    Cu *cu = a->cu;
+    cu_open(cu, id,
+            &(CuBox){.row = true, CU_PAD2(3, 6), .gap = 6, .radius = 5, .align_y = CU_CENTER,
+                     .bg = hover_bg(a, id, enabled, 0, C_BUTTON), .interactive = true, .focusable = enabled,
+                     .tooltip = tooltip, .opacity = enabled ? 0 : 0.45f,
+                     .border = cu_focus_visible(cu, id) ? 1.5f : 0, .border_color = C_FOCUS});
+    cu_open(cu, 0,
+            &(CuBox){.w = CU_PX(size + 1), .h = CU_PX(size + 1), .radius = 3, .bg = *value ? C_ACCENT : 0, .border = 1,
+                     .border_color = *value ? C_ACCENT : 0xff6a6a6a, .align_x = CU_CENTER, .align_y = CU_CENTER});
+    if (*value)
+        cu_icon(cu, "check", size, 0xffffffff);
+    cu_close(cu);
+    cu_text(cu, 0, text, &(CuTextStyle){.font = ui_font(a, size, 400), .color = color});
+    cu_close(cu);
+    if (enabled && cu_clicked(cu, id)) {
+        *value = !*value;
+        return true;
+    }
+    return false;
+}
 static void paint_switch(Cu *cu, CuCanvas *c, CuRect r, void *data) {
     bool on = data != NULL;
     const CuPlatform *p = cu_platform(cu);
@@ -132,6 +155,13 @@ bool ui_switch(App *a, CuId id, bool *value, bool enabled) {
         return true;
     }
     return false;
+}
+/* The switch without its own click, for a row that takes the click, as a menu row does. */
+void ui_switch_mark(App *a, bool on, bool enabled) {
+    Cu *cu = a->cu;
+    cu_open(cu, 0, &(CuBox){.opacity = enabled ? 0 : 0.5f});
+    cu_custom(cu, 0, CU_PX(30), CU_PX(18), paint_switch, on ? (void *)1 : NULL);
+    cu_close(cu);
 }
 bool ui_dropdown(App *a, CuId id, const char *const *choices, int count, int *value, bool enabled, bool flat) {
     Cu *cu = a->cu;
@@ -214,7 +244,7 @@ bool ui_spin(App *a, CuId id, CuEdit *edit, double min, double max, double step,
     int flags = cu_edit(cu, id, edit, &(CuEditStyle){.font = ui_font(a, 14, 400), .color = C_TEXT, .disabled = !enabled, .max_length = 12});
     cu_close(cu);
     for (int i = 0; i < 2; i++) {
-        CuId b = cu_idn(cu, "#spin", (int64_t)id * 2 + i);
+        CuId b = cu_idn(cu, "#spin", (int64_t)(id * 2 + (CuId)i));
         cu_open(cu, b, &(CuBox){CU_PAD2(7, 10), .border_t = 0, .bg = cu_hovered(cu, b) ? 0xff333333 : 0,
                                 .interactive = true, .opacity = enabled ? 0 : .4f, .radius = i ? 6 : 0});
         cu_text(cu, 0, i ? "+" : "−", &(CuTextStyle){.font = ui_font(a, 15, 400), .color = C_TEXT});
@@ -234,30 +264,28 @@ bool ui_spin(App *a, CuId id, CuEdit *edit, double min, double max, double step,
 }
 typedef struct {
     double fraction;
-    int64_t now;
-} Progress;
-static void paint_progress(Cu *cu, CuCanvas *c, CuRect r, void *data) {
-    Progress *p = data;
+    CuColor color;
+} Bar;
+static void paint_bar(Cu *cu, CuCanvas *c, CuRect r, void *data) {
+    Bar *bar = data;
     const CuPlatform *pl = cu_platform(cu);
-    pl->fill_rect(c, r, 1.5f, 0xff383838);
-    if (p->fraction >= 0)
-        pl->fill_rect(c, (CuRect){r.x, r.y, r.w * (float)CH_CLAMP(p->fraction, 0, 1), r.h}, 1.5f, C_ACCENT);
-    else {
-        /* Indeterminate: a segment sweeping across the trough. */
-        double t = fmod((double)p->now / 1.4e6, 1.0);
-        float w = r.w * 0.22f, x = r.x - w + (r.w + w) * (float)t;
-        CuRect seg = {fmaxf(r.x, x), r.y, fminf(r.x + r.w, x + w) - fmaxf(r.x, x), r.h};
-        if (seg.w > 0)
-            pl->fill_rect(c, seg, 1.5f, C_ACCENT);
-    }
+    pl->fill_rect(c, r, r.h / 2, 0xff383838);
+    float width = r.w * (float)CH_CLAMP(bar->fraction, 0, 1);
+    if (width > 0)
+        pl->fill_rect(c, (CuRect){r.x, r.y, fmaxf(width, r.h), r.h}, r.h / 2, bar->color);
 }
+static void bar_build(App *a, CuId id, double fraction, CuColor color, float width, float height) {
+    Bar *bar = cu_frame_alloc(a->cu, sizeof(Bar));
+    *bar = (Bar){fraction, color};
+    cu_custom(a->cu, id, width > 0 ? CU_PX(width) : CU_GROW, CU_PX(height), paint_bar, bar);
+}
+/* A bar shows how much is done, and nothing else: no sweep stands in for progress. */
 void ui_progress(App *a, CuId id, double fraction, float width) {
-    Progress *p = cu_frame_alloc(a->cu, sizeof(Progress));
-    p->fraction = fraction;
-    p->now = cu_now(a->cu);
-    cu_custom(a->cu, id, width > 0 ? CU_PX(width) : CU_GROW, CU_PX(3), paint_progress, p);
-    if (fraction < 0)
-        cu_animate(a->cu, 33);
+    bar_build(a, id, fraction, C_ACCENT, width, 4);
+}
+/* How full something is, in the colour that says whether to worry. */
+void ui_meter(App *a, CuId id, double fraction, CuColor color) {
+    bar_build(a, id, fraction, color, 0, 6);
 }
 static void paint_spinner(Cu *cu, CuCanvas *c, CuRect r, void *data) {
     (void)data;

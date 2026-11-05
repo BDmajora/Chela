@@ -147,6 +147,7 @@ bool ch_unichar_isspace(uint32_t c);
 int64_t ch_monotonic_us(void);
 int64_t ch_real_us(void);
 void ch_usleep(int64_t us);
+int ch_clipboard_best(const char *const *mimes, int count); /* the MIME type to read, or -1 */
 char *ch_uuid_random(void);
 bool ch_uuid_valid(const char *s);
 void ch_random_bytes(void *buf, size_t n);

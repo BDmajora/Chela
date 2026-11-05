@@ -16,6 +16,8 @@ void text_layout_free(TextLayout *layout) {
     if (!layout)
         return;
     free(layout->text);
+    for (int i = 0; i < layout->span_count; i++)
+        free((char *)layout->spans[i].link);
     free(layout->spans);
     free(layout->span_start);
     free(layout->lines);
@@ -42,6 +44,8 @@ static TextLayout *collect(const CuSpan *spans, int count, const TextOptions *o)
     ch_buf_init(&b);
     for (int i = 0; i < count; i++) {
         l->spans[i] = spans[i];
+        /* A layout outlives the frame that built it, so it keeps its own copy. */
+        l->spans[i].link = spans[i].link ? ch_strdup(spans[i].link) : NULL;
         l->span_start[i] = b.len;
         size_t n = spans[i].length == SIZE_MAX ? strlen(spans[i].text) : spans[i].length;
         for (size_t k = 0; k < n; k++) {
@@ -321,6 +325,21 @@ TextLayout *text_layout_new(Cu *cu, const CuSpan *spans, int count, const TextOp
     return finish(&b);
 }
 
+const char *text_layout_link(Cu *cu, const TextLayout *l, float x, float y) {
+    for (int i = 0; i < l->line_count; i++) {
+        const TextLine *line = &l->lines[i];
+        if (y < line->y || y >= line->y + line->h)
+            continue;
+        for (int r = 0; r < line->run_count; r++) {
+            const TextRun *run = &l->runs[line->first_run + r];
+            if (x >= run->x && x < run->x + run->w)
+                return l->spans[run->span].link;
+        }
+    }
+    (void)cu;
+    return NULL;
+}
+
 /* Geometry queries */
 static float run_x(Cu *cu, const TextLayout *l, const TextRun *r, size_t offset) {
     if (offset <= r->start)
@@ -339,21 +358,25 @@ static int line_of(const TextLayout *l, size_t offset) {
     }
     return l->line_count - 1;
 }
+/* Where an offset falls along one line. The end of a wrapped line is also the start of
+ * the next, so anything measuring a line must ask here rather than for the caret. */
+static float line_x(Cu *cu, const TextLayout *l, const TextLine *line, size_t offset) {
+    float x = line->x;
+    for (int r = 0; r < line->run_count; r++) {
+        const TextRun *run = &l->runs[line->first_run + r];
+        if (offset >= run->start)
+            x = run_x(cu, l, run, offset);
+    }
+    return x;
+}
 void text_layout_caret(Cu *cu, const TextLayout *l, size_t offset, float *x, float *y, float *h) {
     if (!l->line_count) {
         *x = *y = 0;
         *h = 16;
         return;
     }
-    int li = line_of(l, offset);
-    const TextLine *line = &l->lines[li];
-    float cx = line->x;
-    for (int r = 0; r < line->run_count; r++) {
-        const TextRun *run = &l->runs[line->first_run + r];
-        if (offset >= run->start)
-            cx = run_x(cu, l, run, offset);
-    }
-    *x = cx;
+    const TextLine *line = &l->lines[line_of(l, offset)];
+    *x = line_x(cu, l, line, offset);
     *y = line->y;
     *h = line->h;
 }
@@ -403,19 +426,7 @@ void text_layout_paint(Cu *cu, CuCanvas *c, const TextLayout *l, float x, float 
     const CuPlatform *p = cu->p;
     for (int i = 0; i < l->line_count; i++) {
         const TextLine *line = &l->lines[i];
-        if (a < b) {
-            size_t next = i + 1 < l->line_count ? l->lines[i + 1].start : l->length + 1;
-            size_t s = CH_MAX(a, line->start), e = CH_MIN(b, CH_MAX(line->end, line->start));
-            if (s < next && b > line->start && a <= CH_MAX(line->end, line->start)) {
-                float x1, x2, yy, hh;
-                text_layout_caret(cu, l, s, &x1, &yy, &hh);
-                text_layout_caret(cu, l, e, &x2, &yy, &hh);
-                if (b > line->end && i + 1 < l->line_count)
-                    x2 += 5;
-                if (x2 > x1)
-                    p->fill_rect(c, (CuRect){x + x1, y + line->y, x2 - x1, line->h}, 0, cu_apply_alpha(cu, selection));
-            }
-        }
+        /* Backgrounds, the selection, then letters: selected code is tinted like its neighbours. */
         for (int r = 0; r < line->run_count; r++) {
             const TextRun *run = &l->runs[line->first_run + r];
             const CuSpan *span = &l->spans[run->span];
@@ -425,8 +436,30 @@ void text_layout_paint(Cu *cu, CuCanvas *c, const TextLayout *l, float x, float 
                 p->fill_rect(c, (CuRect){x + run->x - 2, top, run->w + 4, m.ascent + m.descent + 2}, 3,
                              cu_apply_alpha(cu, span->bg));
             }
+        }
+        if (a < b) {
+            size_t next = i + 1 < l->line_count ? l->lines[i + 1].start : l->length + 1;
+            size_t s = CH_MAX(a, line->start), e = CH_MIN(b, CH_MAX(line->end, line->start));
+            if (s < next && b > line->start && a <= CH_MAX(line->end, line->start)) {
+                float x1 = line_x(cu, l, line, s), x2 = line_x(cu, l, line, e);
+                /* A selected line break shows, so an empty line in a selection can be seen. */
+                if (b > line->end && i + 1 < l->line_count && l->text[line->end] == '\n')
+                    x2 += 5;
+                if (x2 > x1)
+                    p->fill_rect(c, (CuRect){x + x1, y + line->y, x2 - x1, line->h}, 0, cu_apply_alpha(cu, selection));
+            }
+        }
+        for (int r = 0; r < line->run_count; r++) {
+            const TextRun *run = &l->runs[line->first_run + r];
+            const CuSpan *span = &l->spans[run->span];
             p->draw_text(c, span->font, x + run->x, y + line->y + line->ascent, l->text + run->start,
                          run->end - run->start, cu_apply_alpha(cu, span->color));
+            if (span->underline || span->strike) {
+                CuFontMetrics m = cu_font_metrics(cu, span->font);
+                float baseline = y + line->y + line->ascent, thick = fmaxf(1, m.height / 18);
+                float ly = span->strike ? baseline - m.ascent * 0.3f : baseline + fmaxf(1.5f, m.descent * 0.35f);
+                p->fill_rect(c, (CuRect){x + run->x, ly, run->w, thick}, 0, cu_apply_alpha(cu, span->color));
+            }
         }
     }
 }

@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CU_PLATFORM_ABI 1
+#define CU_PLATFORM_ABI 2
 
 typedef uint32_t CuColor; /* 0xAARRGGBB */
 typedef struct {
@@ -21,6 +21,7 @@ typedef struct {
 typedef struct CuWindow CuWindow;   /* backend window */
 typedef struct CuCanvas CuCanvas;   /* backend paint context, valid during paint */
 typedef struct CuFont CuFont;       /* backend font, owned and cached by the backend */
+typedef struct CuImage CuImage;     /* backend bitmap */
 typedef struct {
     const char *family; /* comma-separated preference list, e.g. "Arial, Liberation Sans, sans-serif" */
     float size;         /* logical pixels */
@@ -81,6 +82,8 @@ typedef enum {
     CU_EV_FOCUS,
     CU_EV_RESIZE,
     CU_EV_CLOSE,
+    CU_EV_DRAG, /* files are dragged over the window (focused), or left it (!focused) */
+    CU_EV_DROP, /* mime, data and size: what was dropped */
 } CuEventType;
 typedef struct {
     CuEventType type;
@@ -92,6 +95,9 @@ typedef struct {
     int width, height;  /* resize */
     float scale;        /* resize */
     const char *text;   /* text input and preedit (UTF-8), valid during the call */
+    const char *mime;   /* drop */
+    const void *data;   /* drop, valid during the call */
+    size_t size;
 } CuEvent;
 
 typedef struct {
@@ -131,9 +137,14 @@ typedef struct CuPlatform {
     unsigned (*timer_add)(int milliseconds, bool (*fn)(void *data), void *data); /* repeats while fn returns true */
     void (*timer_remove)(unsigned id);
 
-    /* Clipboard. request delivers NULL when no text is available. */
+    /* Clipboard. request delivers NULL when no text is available. request_data delivers
+     * the most useful form on offer, which may be files or an image (see
+     * ch_clipboard_best); mime is NULL when the clipboard is empty. Optional. */
     void (*clipboard_set)(CuWindow *window, const char *text);
     void (*clipboard_request)(CuWindow *window, void (*callback)(const char *text, void *data), void *data);
+    void (*clipboard_request_data)(CuWindow *window,
+                                   void (*callback)(const char *mime, const void *bytes, size_t size, void *data),
+                                   void *data);
 
     /* Text. Fonts are cached by the backend for the life of the process. */
     CuFont *(*font_get)(const CuFontDesc *desc);
@@ -156,6 +167,10 @@ typedef struct CuPlatform {
     void (*stroke_path)(CuCanvas *c, float width, CuColor color);
     void (*draw_text)(CuCanvas *c, CuFont *font, float x, float baseline, const char *text, size_t length,
                       CuColor color);
+    /* Bitmaps of premultiplied ARGB32 pixels; the backend keeps its own copy. */
+    CuImage *(*image_new)(const uint32_t *pixels, int width, int height);
+    void (*image_free)(CuImage *image);
+    void (*draw_image)(CuCanvas *c, CuImage *image, CuRect r, float radius);
 
     /* Optional native file dialogs; NULL uses Chela's own file browser. The callback
      * receives NULL on cancel. kind: 0 open file, 1 choose folder, 2 save file. */

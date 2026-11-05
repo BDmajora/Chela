@@ -3,6 +3,7 @@
  * dialog again by serial number, so closing a dialog never races a worker. */
 #include "app.h"
 #include <dirent.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -36,11 +37,8 @@ static Dialog *top_dialog(App *a) {
     return NULL;
 }
 void dialogs_build(App *a) {
-    for (size_t i = 0; i < a->dialogs.len; i++) {
-        Dialog *d = a->dialogs.data[i];
-        if (!d->closed)
-            d->build(a, d);
-    }
+    /* A dialog closed during last frame's build is freed only now: that frame's layout
+     * still read its text fields. */
     for (size_t i = 0; i < a->dialogs.len;) {
         Dialog *d = a->dialogs.data[i];
         if (d->closed) {
@@ -50,6 +48,11 @@ void dialogs_build(App *a) {
             free(d);
         } else
             i++;
+    }
+    for (size_t i = 0; i < a->dialogs.len; i++) {
+        Dialog *d = a->dialogs.data[i];
+        if (!d->closed)
+            d->build(a, d);
     }
 }
 void dialogs_free(App *a) {
@@ -138,12 +141,14 @@ void app_notice(App *a, const char *title, const char *text) {
 void open_shortcuts(App *a) {
     app_notice(a, "Keyboard shortcuts",
                "Ctrl+N     New session\nCtrl+K     Search sessions\nCtrl+B     Toggle sidebar\n"
-               "Ctrl+,       Connection settings\nCtrl+M     Permission mode\nCtrl+Shift+M     Switch Agent / Chat\n"
+               "Ctrl+,       Settings\nCtrl+M     Permission mode, then 1 to 5\nCtrl+Shift+M     Switch Agent / Chat\n"
                "Ctrl+Shift+L     Model menu\nCtrl+Shift+P     Project menu\nCtrl+Shift+A     Attach menu\n"
                "Ctrl+Shift+O     Session menu\nCtrl+Shift+F     Group and sort\n"
                "Ctrl+Shift+E     Environment menu\nCtrl+Shift+U     Workspace menu\nCtrl+1 / Ctrl+2     Chat / Code\n"
                "Ctrl+U     Attach file\nCtrl+D     Dictate\nCtrl+Shift+V     Voice options\n"
-               "Ctrl+Shift+S     Model status\nCtrl+Shift+D     Server diagnostics\n"
+               "Ctrl+Shift+S     Context use\nCtrl+Shift+D     Server diagnostics\n"
+               "Ctrl+A     Select all\nCtrl+C     Copy selection\nCtrl+click     Mark sessions in the sidebar\n"
+               "Page Up / Page Down     Scroll the transcript\n"
                "Enter     Send message\nShift+Enter     New line\nEsc     Stop current request\nCtrl+Q     Quit");
 }
 void open_about(App *a) {
@@ -159,8 +164,8 @@ void open_about(App *a) {
 /* Confirmation */
 typedef struct {
     Dialog base;
-    char *title, *text, *accept;
-    bool destructive;
+    char *title, *text, *accept, *option, *detail;
+    bool destructive, *checked;
     void (*callback)(App *, void *);
     void *data;
 } Confirm;
@@ -169,12 +174,20 @@ static void confirm_destroy(Dialog *d) {
     free(c->title);
     free(c->text);
     free(c->accept);
+    free(c->option);
+    free(c->detail);
 }
 static void confirm_build(App *a, Dialog *d) {
     Confirm *c = (Confirm *)d;
     bool cancel = dialog_frame_begin(a, d, c->title, 460, 0);
     body_begin(a, false);
     ui_text_block(a, cu_id(a->cu, "confirm-text"), c->text, 14, C_TEXT2, false);
+    if (c->option) {
+        ui_checkbox(a, cu_id(a->cu, "confirm-option"), c->option, c->checked, true);
+        cu_open(a->cu, 0, &(CuBox){.w = CU_GROW, .pad_l = 26});
+        ui_text_block(a, cu_id(a->cu, "confirm-detail"), c->detail, 12, C_MUTED, false);
+        cu_close(a->cu);
+    }
     body_end(a);
     int choice = -1;
     dialog_footer_buttons(a, d, "Cancel", c->accept, true, &choice);
@@ -185,8 +198,8 @@ static void confirm_build(App *a, Dialog *d) {
         dialog_close(a, d);
     dialog_frame_end(a);
 }
-void dialog_confirm(App *a, const char *title, const char *text, const char *accept, bool destructive,
-                    void (*callback)(App *, void *), void *data) {
+static Confirm *confirm_new(const char *title, const char *text, const char *accept, bool destructive,
+                            void (*callback)(App *, void *), void *data) {
     Confirm *c = ch_new0(Confirm, 1);
     c->base.build = confirm_build;
     c->base.destroy = confirm_destroy;
@@ -196,6 +209,19 @@ void dialog_confirm(App *a, const char *title, const char *text, const char *acc
     c->destructive = destructive;
     c->callback = callback;
     c->data = data;
+    return c;
+}
+void dialog_confirm(App *a, const char *title, const char *text, const char *accept, bool destructive,
+                    void (*callback)(App *, void *), void *data) {
+    dialog_push(a, &confirm_new(title, text, accept, destructive, callback, data)->base);
+}
+/* A destructive confirmation with one choice that goes with it, left in *checked. */
+void dialog_confirm_option(App *a, const char *title, const char *text, const char *accept, const char *option,
+                           const char *detail, bool *checked, void (*callback)(App *, void *), void *data) {
+    Confirm *c = confirm_new(title, text, accept, true, callback, data);
+    c->option = ch_strdup(option);
+    c->detail = ch_strdup(detail);
+    c->checked = checked;
     dialog_push(a, &c->base);
 }
 
@@ -565,31 +591,22 @@ static void appearance_row(App *a, const char *title, const char *const *choices
     }
     cu_close(cu);
 }
+static void setting_row(App *a, const char *title, const char *detail, CuId *row);
 static void general_page(App *a) {
     Cu *cu = a->cu;
-    cu_open(cu, 0, &(CuBox){.w = CU_GROW, CU_PAD(16)});
+    cu_open(cu, 0, &(CuBox){.w = CU_GROW, CU_PAD(24)});
+    cu_text(cu, 0, "General", &(CuTextStyle){.font = ui_font(a, 22, 600), .color = C_TEXT});
+    cu_spacer(cu, CU_PX(1), CU_PX(18));
     cu_text(cu, 0, "Appearance", &(CuTextStyle){.font = ui_font(a, 14, 600), .color = C_TEXT});
     cu_spacer(cu, CU_PX(1), CU_PX(10));
-    cu_open(cu, 0, &(CuBox){.row = true, .w = CU_GROW, .h = CU_FIT_MIN(52), .align_y = CU_CENTER, .border_b = 1,
-                            .border_color = 0xff2e2e2e, CU_PAD2(10, 0)});
-    cu_text(cu, 0, "Theme", &(CuTextStyle){.font = ui_font(a, 14, 400), .color = C_TEXT, .w = CU_GROW});
-    cu_open(cu, 0, &(CuBox){.row = true, .bg = 0xff2b2b2b, .radius = 6, CU_PAD(1)});
-    const char *icons[] = {"computer", "sun", "moon"};
-    const char *tips[] = {"System theme is not available yet", "Light theme is not available yet", "Dark"};
-    for (int i = 0; i < 3; i++)
-        ui_icon_button_sized(a, cu_idn(cu, "theme", i), icons[i], 18, 5, tips[i], i == 2, i == 2);
-    cu_close(cu);
-    cu_close(cu);
     const char *interfaces[] = {"Default sans", "Noto Sans", "DejaVu Sans"};
     const char *responses[] = {"Default serif", "Match interface"};
     const char *sizes[] = {"Small", "Medium", "Large"};
     const char *widths[] = {"Narrow", "Medium", "Wide"};
-    const char *motions[] = {"System", "Reduced", "Full"};
     appearance_row(a, "Interface font", interfaces, 3, &a->interface_font);
     appearance_row(a, "Response font", responses, 2, &a->response_font);
     appearance_row(a, "Transcript text size", sizes, 3, &a->text_size);
     appearance_row(a, "Transcript width", widths, 3, &a->transcript_width);
-    appearance_row(a, "Motion", motions, 3, &a->motion);
     cu_spacer(cu, CU_PX(1), CU_PX(40));
     cu_text(cu, 0, "Voice", &(CuTextStyle){.font = ui_font(a, 14, 600), .color = C_TEXT});
     cu_spacer(cu, CU_PX(1), CU_PX(14));
@@ -598,6 +615,16 @@ static void general_page(App *a) {
     cu_text(cu, 0, "Dictation", &(CuTextStyle){.font = ui_font(a, 14, 400), .color = C_TEXT, .w = CU_GROW});
     if (ui_flat_button(a, cu_id(cu, "voice-settings"), NULL, "Voice settings…", NULL, 14, C_TEXT, NULL, true, 0))
         open_voice_settings(a);
+    cu_close(cu);
+    cu_spacer(cu, CU_PX(1), CU_PX(40));
+    cu_text(cu, 0, "Permissions", &(CuTextStyle){.font = ui_font(a, 14, 600), .color = C_TEXT});
+    cu_spacer(cu, CU_PX(1), CU_PX(14));
+    setting_row(a, "Bypass permissions", "Offer the mode that runs edits and commands without asking.", NULL);
+    if (ui_switch(a, cu_id(cu, "bypass-enabled"), &a->bypass_enabled, true)) {
+        prefs_save(a);
+        if (!a->bypass_enabled && a->mode == CH_BYPASS)
+            app_set_mode(a, CH_ASK);
+    }
     cu_close(cu);
     cu_close(cu);
 }
@@ -802,11 +829,64 @@ static void connections_page(App *a, Settings *s) {
     }
     cu_close(cu);
 }
-static void code_page(App *a, Settings *s) {
+static void setting_row(App *a, const char *title, const char *detail, CuId *row) {
     Cu *cu = a->cu;
-    cu_open(cu, 0, &(CuBox){.w = CU_GROW, CU_PAD(24), .gap = 18});
-    cu_text(cu, 0, "Code", &(CuTextStyle){.font = ui_font(a, 22, 600), .color = C_TEXT});
-    ui_label_wrap(a, "Configure your direct model connection. External harnesses use their own settings.", 13, C_MUTED, 460);
+    cu_open(cu, row ? *row : 0, &(CuBox){.row = true, .w = CU_GROW, .h = CU_FIT_MIN(52), .align_y = CU_CENTER, .border_b = 1, .gap = 16,
+                                         .border_color = 0xff2e2e2e, CU_PAD2(10, 0), .interactive = row != NULL});
+    cu_open(cu, 0, &(CuBox){.w = CU_GROW, .gap = 3});
+    cu_text(cu, 0, title, &(CuTextStyle){.font = ui_font(a, 14, 400), .color = C_TEXT});
+    if (detail)
+        ui_label_wrap(a, detail, 12, C_MUTED, 460);
+    cu_close(cu);
+}
+static void models_page(App *a, Settings *s) {
+    Cu *cu = a->cu;
+    cu_open(cu, 0, &(CuBox){.w = CU_GROW, CU_PAD(24), .gap = 4});
+    cu_text(cu, 0, "Models", &(CuTextStyle){.font = ui_font(a, 22, 600), .color = C_TEXT});
+    cu_spacer(cu, CU_PX(1), CU_PX(10));
+    bool supported = ch_thinking_supported(&a->config), gpt = ch_model_is_gpt_oss(&a->config);
+    setting_row(a, "Effort", !supported ? "Set this in your server or harness for this connection."
+                             : gpt ? "GPT-OSS always reasons, so Off is the same as Quick."
+                                   : "More effort can help with hard tasks, but takes longer and shares your response limit.", NULL);
+    const char *levels[] = {"Model default", "Off", "Quick", "Balanced", "Deep"};
+    int level = (int)a->config.thinking;
+    cu_open(cu, 0, &(CuBox){.w = CU_PX(180)});
+    if (ui_dropdown(a, cu_id(cu, "thinking-level"), levels, 5, &level, supported, false)) {
+        ChConfig config = a->config;
+        config.thinking = (ChThinking)level;
+        app_save_config(a, &config, "Could not save effort");
+    }
+    cu_close(cu);
+    cu_close(cu);
+    /* Whether to load ahead of time and when to free the memory are separate choices. */
+    model_preload_row(a);
+    if (model_control_supported(a)) {
+        setting_row(a, "Unload when idle", "Frees GPU and RAM while you are not using the model. The next message loads it again.", NULL);
+        const char *idle[] = {"After 5 min", "After 15 min", "After 30 min", "After 1 hour", "Never"};
+        const int values[] = {300, 900, 1800, 3600, 0};
+        int index = 4;
+        for (int i = 0; i < 5; i++)
+            if (values[i] == a->idle_unload_seconds)
+                index = i;
+        cu_open(cu, 0, &(CuBox){.w = CU_PX(180)});
+        if (ui_dropdown(a, cu_id(cu, "idle-unload"), idle, 5, &index, true, false)) {
+            a->idle_unload_seconds = values[index];
+            a->model_idle_since = ch_monotonic_us();
+            prefs_save(a);
+        }
+        cu_close(cu);
+        cu_close(cu);
+    }
+    cu_spacer(cu, CU_PX(1), CU_PX(26));
+    cu_text(cu, 0, "Current model", &(CuTextStyle){.font = ui_font(a, 14, 600), .color = C_TEXT});
+    cu_spacer(cu, CU_PX(1), CU_PX(10));
+    model_details_build(a);
+    cu_spacer(cu, CU_PX(1), CU_PX(26));
+    cu_text(cu, 0, "Requests", &(CuTextStyle){.font = ui_font(a, 14, 600), .color = C_TEXT});
+    cu_spacer(cu, CU_PX(1), CU_PX(6));
+    ui_label_wrap(a, "Used with your direct model connection. External harnesses use their own settings.", 13, C_MUTED, 460);
+    cu_spacer(cu, CU_PX(1), CU_PX(8));
+    cu_open(cu, 0, &(CuBox){.w = CU_GROW, .gap = 14});
     field_row(a, "Max output tokens");
     ui_spin(a, cu_id(cu, "tokens"), &s->tokens, 1, 131072, 256, 0, true);
     field_end(a);
@@ -817,6 +897,7 @@ static void code_page(App *a, Settings *s) {
     ui_spin(a, cu_id(cu, "timeout"), &s->timeout, 1, 3600, 30, 0, true);
     field_end(a);
     ui_checkbox(a, cu_id(cu, "tools"), "Enable project tools (Chat reads; Agent can edit and run commands)", &s->tools, true);
+    cu_close(cu);
     cu_close(cu);
 }
 static void settings_build(App *a, Dialog *d) {
@@ -846,8 +927,8 @@ static void settings_build(App *a, Dialog *d) {
     cu_open(cu, 0, &(CuBox){.pad_l = 18, .pad_t = 24, .pad_b = 8});
     ui_label(a, "Preferences", 12, C_MUTED);
     cu_close(cu);
-    const char *titles[] = {"General", "Connections", "Code"};
-    const char *icons[] = {"preferences-system", "computer", "utilities-terminal"};
+    const char *titles[] = {"General", "Connections", "Models"};
+    const char *icons[] = {"preferences-system", "network-server", "thinking"};
     char *query = ch_utf8_casefold(cu_edit_text(&s->search));
     int first = -1;
     for (int i = 0; i < 3; i++) {
@@ -879,13 +960,13 @@ static void settings_build(App *a, Dialog *d) {
     else if (s->page == 1)
         connections_page(a, s);
     else
-        code_page(a, s);
+        models_page(a, s);
     cu_close(cu);
     cu_close(cu);
     int choice = -1;
-    if (s->page == 1)
+    if (s->page == SETTINGS_CONNECTIONS)
         dialog_footer_buttons(a, d, "Cancel", "Connect & refresh library", !s->connecting, &choice);
-    else if (s->page == 2)
+    else if (s->page == SETTINGS_MODELS)
         dialog_footer_buttons(a, d, "Cancel", "Save settings", true, &choice);
     if (choice == 1 && s->page == 1)
         connect_library(a, s);
@@ -951,6 +1032,55 @@ void open_settings(App *a, int page) {
                                     "GPU + RAM. Advanced includes RAM experts and CPU-only modes. After connecting, use "
                                     "Test selected model in the model picker.", NULL);
     dialog_push(a, &s->base);
+}
+
+/* A picture at full size, or as large as the window allows. */
+typedef struct {
+    Dialog base;
+    char *path, *name;
+} ImageView;
+static void image_view_destroy(Dialog *d) {
+    ImageView *v = (ImageView *)d;
+    free(v->path);
+    free(v->name);
+}
+typedef struct {
+    CuImage *image;
+    float width, height;
+} ViewPaint;
+static void paint_view(Cu *cu, CuCanvas *c, CuRect r, void *data) {
+    ViewPaint *v = data;
+    float scale = fminf(fminf(r.w / v->width, r.h / v->height), 1);
+    float w = v->width * scale, h = v->height * scale;
+    cu_platform(cu)->draw_image(c, v->image, (CuRect){r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h}, 6);
+}
+static void image_view_build(App *a, Dialog *d) {
+    ImageView *v = (ImageView *)d;
+    Cu *cu = a->cu;
+    bool cancel = dialog_frame_begin(a, d, v->name, cu_width(cu) - 96, cu_height(cu) - 96);
+    int width = 0, height = 0;
+    CuImage *image = thumb_image(a, v->path, 2400, &width, &height);
+    cu_open(cu, cu_id(cu, "image-view"), &(CuBox){.w = CU_GROW, .h = CU_GROW, CU_PAD(12), .align_x = CU_CENTER, .align_y = CU_CENTER});
+    if (image) {
+        ViewPaint *paint = cu_frame_alloc(cu, sizeof(ViewPaint));
+        *paint = (ViewPaint){image, (float)width, (float)height};
+        cu_custom(cu, 0, CU_GROW, CU_GROW, paint_view, paint);
+    } else if (!ch_file_exists(v->path))
+        ui_label(a, "This file is no longer available.", 13, C_MUTED);
+    else
+        ui_spinner(a, 20);
+    cu_close(cu);
+    if (cancel)
+        dialog_close(a, d);
+    dialog_frame_end(a);
+}
+void open_image(App *a, const char *path, const char *name) {
+    ImageView *v = ch_new0(ImageView, 1);
+    v->base.build = image_view_build;
+    v->base.destroy = image_view_destroy;
+    v->path = ch_strdup(path);
+    v->name = ch_strdup(name);
+    dialog_push(a, &v->base);
 }
 
 /* Diagnostics */
@@ -1291,10 +1421,14 @@ typedef struct {
 static void all_destroy(Dialog *d) {
     ch_vec_free(((AllSessions *)d)->sessions);
 }
-static void open_from_all(App *a, const char *id) {
-    char *copy = ch_strdup(id);
-    a->filter_type = a->activity_days = 0;
-    ch_clear_pointer(&a->filter_project, free);
+static void open_from_all(App *a, const ChSession *session) {
+    char *copy = ch_strdup(session->id);
+    ChError *error = NULL;
+    if (session->archived && !ch_store_set_archived(a->store, copy, false, &error)) {
+        app_notice(a, "Could not restore session", error->message);
+        ch_clear_error(&error);
+    }
+    a->activity_days = 0;
     cu_edit_set(&a->search, "");
     app_refresh_sessions(a);
     app_select_session(a, copy);
@@ -1305,17 +1439,20 @@ static void all_build(App *a, Dialog *d) {
     Cu *cu = a->cu;
     bool cancel = dialog_frame_begin(a, d, "All sessions", 800, 560);
     body_begin(a, true);
-    char *open = NULL;
+    const ChSession *open = NULL;
     for (size_t i = 0; s->sessions && i < s->sessions->len; i++) {
         ChSession *v = s->sessions->data[i];
         CuId id = cu_ids(cu, "all-row", v->id);
         cu_open(cu, id, &(CuBox){.w = CU_GROW, .gap = 5, CU_PAD2(8, 10), .radius = 6, .interactive = true,
                                  .bg = s->selected == (int)i ? C_SELECTED : cu_hovered(cu, id) ? C_HOVER : 0});
         cu_text(cu, 0, v->title, &(CuTextStyle){.font = ui_font(a, 14, 400), .color = C_TEXT, .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
-        cu_text(cu, 0, v->project, &(CuTextStyle){.font = ui_font(a, 12, 400), .color = C_MUTED, .ellipsize = CU_ELLIPSIZE_MIDDLE, .w = CU_GROW});
+        if (*v->project)
+            cu_text(cu, 0, v->project, &(CuTextStyle){.font = ui_font(a, 12, 400), .color = C_MUTED, .ellipsize = CU_ELLIPSIZE_MIDDLE, .w = CU_GROW});
+        if (v->archived)
+            cu_text(cu, 0, "Archived", &(CuTextStyle){.font = ui_font(a, 12, 400), .color = C_FAINT});
         cu_close(cu);
         if (cu_double_clicked(cu, id))
-            open = ch_strdup(v->id);
+            open = v;
         else if (cu_clicked(cu, id))
             s->selected = (int)i;
     }
@@ -1323,15 +1460,15 @@ static void all_build(App *a, Dialog *d) {
         ui_label(a, "No sessions yet.", 13, C_FAINT);
     body_end(a);
     int choice = -1;
-    dialog_footer_buttons(a, d, "Close", "Open session", s->selected >= 0 && !a->busy, &choice);
-    if (choice == 1 && s->selected >= 0 && !open)
-        open = ch_strdup(((ChSession *)s->sessions->data[s->selected])->id);
+    const ChSession *chosen = s->selected >= 0 ? s->sessions->data[s->selected] : NULL;
+    dialog_footer_buttons(a, d, "Close", chosen && chosen->archived ? "Restore session" : "Open session", chosen && !a->busy, &choice);
+    if (choice == 1 && !open)
+        open = chosen;
     if (open && !a->busy) {
         dialog_close(a, d);
         open_from_all(a, open);
     } else if (choice == 0 || cancel)
         dialog_close(a, d);
-    free(open);
     dialog_frame_end(a);
 }
 void open_all_sessions(App *a) {
@@ -1339,6 +1476,14 @@ void open_all_sessions(App *a) {
     s->base.build = all_build;
     s->base.destroy = all_destroy;
     s->sessions = ch_store_list(a->store, "", NULL);
+    /* The list of the tab it was opened from. */
+    for (size_t i = 0; s->sessions && i < s->sessions->len;) {
+        ChSession *v = s->sessions->data[i];
+        if (v->code != a->code)
+            ch_vec_remove(s->sessions, i);
+        else
+            i++;
+    }
     s->selected = -1;
     dialog_push(a, &s->base);
 }

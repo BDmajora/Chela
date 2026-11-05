@@ -90,7 +90,13 @@ static int run_desktop(const CuPlatform *p, int argc, char **argv) {
     cu_edit_init(&a->composer, true);
     cu_edit_init(&a->search, false);
     a->messages = json_object_new_array();
-    a->project = ch_canonicalize(!setup && argc > 1 ? argv[1] : ".", NULL);
+    /* Only a folder named on the command line opens with Chela; otherwise the choice is the user's. */
+    a->launch_project = !setup && argc > 1 ? ch_canonicalize(argv[1], NULL) : NULL;
+    if (!a->launch_project)
+        a->launch_project = ch_strdup("");
+    a->project = ch_strdup(a->launch_project);
+    ch_vec_init(&a->folders, free);
+    ch_vec_init(&a->git_branches, free);
     char *data = ch_user_data_dir(), *config = ch_user_config_dir();
     char *data_dir = ch_build_path(data, "chela", NULL), *config_dir = ch_build_path(config, "chela", NULL);
     free(data);
@@ -102,7 +108,11 @@ static int run_desktop(const CuPlatform *p, int argc, char **argv) {
     }
     a->config_path = ch_build_path(config_dir, "settings.ini", NULL);
     a->preferences_path = ch_build_path(config_dir, "desktop.ini", NULL);
+    char *worktrees = ch_build_path(data_dir, "worktrees", NULL);
+    a->worktree_root = ch_canonicalize(worktrees, NULL);
+    free(worktrees);
     prefs_load(a);
+    attachments_init(a);
     char *db = ch_build_path(data_dir, "sessions.db", NULL);
     a->store = ch_store_open(db, &error);
     free(db);

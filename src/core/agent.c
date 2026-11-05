@@ -32,7 +32,7 @@ bool ch_agent_run(ChRun *run, json_object *messages, ChError **error) {
                 run->emit(CH_TOOL, name, run->data);
             ChError *local = NULL;
             char *result = NULL;
-            if (!run->config.tools)
+            if (!ch_run_has_tools(run))
                 ch_fail_literal(&local, "Tools are disabled");
             else
                 result = ch_tool_execute(run, name, ch_json_str(f, "arguments"), &local);

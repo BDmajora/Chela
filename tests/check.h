@@ -55,11 +55,11 @@ typedef struct {
     const char *name;
     void (*fn)(void);
 } CheckTest;
-static CheckTest check_tests[64];
+static CheckTest check_tests[128];
 static int check_count;
 static const char *check_filter;
 static inline void check_add(const char *name, void (*fn)(void)) {
-    if (check_count < 64)
+    if (check_count < (int)(sizeof(check_tests) / sizeof(check_tests[0])))
         check_tests[check_count++] = (CheckTest){name, fn};
 }
 static inline void check_message(const char *format, const char *value) {

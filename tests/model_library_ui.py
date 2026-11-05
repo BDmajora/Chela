@@ -58,6 +58,9 @@ class Handler(BaseHTTPRequestHandler):
         try: self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError): pass
     def do_GET(self):
+        if self.path.startswith("/props"):
+            self.reply({})
+            return
         assert self.path == "/v1/models"
         self.reply({"data": [{"id": name, "status": {"value": "loaded" if self.loaded == name else "unloaded"}} for name in ("First-Q8", "Second-Q6")]})
     def do_POST(self):
@@ -119,8 +122,13 @@ def main():
 
             def model_menu(w, item):
                 w.key("ctrl+shift+l")
-                w.wait_visible("^Manage connection…$")
+                w.wait_visible(f"^{item}$")
                 w.tap(item)
+
+            def test_model(w):
+                w.key("ctrl+shift+t")
+                w.wait_visible("^Test model$")
+                w.tap("Test model")
 
             app = start(str(root))
             w = harness.window("^Chela$")
@@ -164,12 +172,11 @@ def main():
             w.key("ctrl+shift+l")
             w.wait_visible("^First-Q8$")
             w.shot("ui-library-models.png")
-            w.key("escape")
-            w.key("ctrl+shift+t")
+            w.tap("Effort")  # the picker's submenu, as well as Settings → Models
             w.wait_visible("^Quick$")
             w.shot("ui-thinking-options.png")
             w.tap("Quick")
-            wait_for(lambda: "thinking=2" in settings_text(), what="the thinking setting")
+            wait_for(lambda: "thinking=2" in settings_text(), what="the effort setting")
             w.tap("Describe a task or ask a question…")
             w.type("try the selected model")
             w.key("return")
@@ -186,21 +193,23 @@ def main():
                     row = conn.execute("SELECT messages FROM sessions ORDER BY updated DESC LIMIT 1").fetchone()
                 return row and json.loads(row[0])[-1].get("content") == "Reply from Second-Q6"
             wait_for(saved_reply, what="the saved reply")
-            w.key("ctrl+shift+l")
-            w.wait_visible("^Test selected model$")
+            w.key("ctrl+shift+t")
+            w.wait_visible("^Test model$")
             w.shot("ui-library-loaded.png")
-            w.tap("Test selected model")
+            w.tap("Test model")
             wait_for(lambda: len((root / "requests.jsonl").read_text().splitlines()) == 2, what="the model test")
             w.wait_visible("Reply from Second-Q6")
             w.shot("ui-model-test-result.png")
+            w.key("escape")
             w.key("escape")
             with sqlite3.connect(db) as conn:
                 messages = json.loads(conn.execute("SELECT messages FROM sessions ORDER BY updated DESC LIMIT 1").fetchone()[0])
             assert len(messages) == 3, messages  # The diagnostic never enters conversation history.
             # Close while a request is still running, then let its callback finish.
             (root / "slow-test").touch()
-            model_menu(w, "Test selected model")
+            test_model(w)
             wait_for(lambda: len((root / "requests.jsonl").read_text().splitlines()) == 3, what="the slow test")
+            w.key("escape")
             w.key("escape")
             (root / "slow-test").unlink()
             time.sleep(1.1)
@@ -229,7 +238,7 @@ def main():
             login()
             wait_for(lambda: len((root / "authenticated").read_text().splitlines()) >= 3, what="the replaced login")
             wait_for(lambda: next((root / "keyring").iterdir()).read_text() == "fixture-only", what="the new password")
-            # Settings → Connections is the same setup; saving Code settings
+            # Settings → Connections is the same setup; saving Models settings
             # must retain the existing login rather than prompt again.
             w.do("idle")
             started = (root / "tunnel-started").stat().st_mtime_ns
@@ -246,7 +255,9 @@ def main():
             assert (root / "tunnel-started").stat().st_mtime_ns == started
             # Cancelling a refreshed setup and its SSH prompt must keep saved settings.
             before = settings_text()
-            model_menu(w, "Manage connection…")
+            w.key("ctrl+comma")
+            w.wait_visible("^Appearance$")
+            w.key("ctrl+2")
             w.wait_visible("^Connect & refresh library$")
             w.tap("Forget saved SSH login")
             wait_for(lambda: not list((root / "keyring").iterdir()), what="the forgotten login")

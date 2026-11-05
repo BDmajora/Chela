@@ -1,9 +1,12 @@
 """Exercise the remote helper without a GPU, downloaded weights, or system services."""
+import configparser
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -106,9 +109,11 @@ class LibraryTests(unittest.TestCase):
         args = library.command(config, self.root)
         self.assertEqual(args[args.index("--device") + 1], "Vulkan0")
         self.assertEqual(args[args.index("--gpu-layers") + 1], "auto")
-        self.assertEqual(args[args.index("--fit-target") + 1], "2048")
         self.assertEqual(args[args.index("--ctx-size") + 1], "4096")
         self.assertNotIn("--cpu-moe", args)
+        # The target differs by model (see vision below), and a command-line value would override each section's.
+        self.assertNotIn("--fit-target", args)
+        self.assertNotIn("--no-mmproj-offload", args)
         args = library.command({**config, "memory_mode": 1}, self.root)
         self.assertIn("--cpu-moe", args)
         args = library.command({**config, "memory_mode": 2}, self.root)
@@ -116,6 +121,7 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(args[args.index("--gpu-layers") + 1], "0")
         self.assertEqual(args[args.index("--fit") + 1], "off")
         self.assertNotIn("--cpu-moe", args)
+        self.assertIn("--no-mmproj-offload", args)  # CPU only means the vision encoder too
         # Mode 3 places each model in its preset section; command-line placement would override it there.
         args = library.command({**config, "memory_mode": 3}, self.root)
         for flag in ("--gpu-layers", "--fit", "--fit-target", "--cpu-moe"):
@@ -220,11 +226,126 @@ class LibraryTests(unittest.TestCase):
         # a supported architecture without routed experts has nothing for the caches to read
         self.assertNotIn("ssd-expert-source", dense)
         self.assertEqual((dense["gpu-layers"], dense["fit"]), ("auto", "on"))
-        # the other modes keep their placement on the command line: sections hold only the model
+        # the other modes keep their placement on the command line: sections hold only the model's own GPU reserve
         with patch.object(Path, "home", return_value=self.root):
             library.prepare({**config, "memory_mode": 0}, data)
-        self.assertNotIn("ssd-", (data / "models.ini").read_text())
+        ini = (data / "models.ini").read_text()
+        self.assertNotIn("ssd-", ini)
+        self.assertEqual(set(re.findall(r"^fit.*$", ini, re.M)), {"fit-target = 1536"})
+        with patch.object(Path, "home", return_value=self.root):
+            library.prepare({**config, "memory_mode": 2}, data)
         self.assertNotIn("fit", (data / "models.ini").read_text())
+
+    def gguf_meta(self, name, values, size=0):
+        """A GGUF header holding the given metadata (strings, booleans, integers), padded to size bytes."""
+        def text(value):
+            raw = value.encode()
+            return struct.pack("<Q", len(raw)) + raw
+        body = b""
+        for key, value in values.items():
+            body += text(key)
+            if isinstance(value, bool):
+                body += struct.pack("<I?", 7, value)
+            elif isinstance(value, int):
+                body += struct.pack("<II", 4, value)
+            else:
+                body += struct.pack("<I", 8) + text(value)
+        path = self.models / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = struct.pack("<4sIQQ", b"GGUF", 3, 0, len(values)) + body
+        path.write_bytes(data.ljust(size, b"\0"))
+        return path
+
+    def text_model(self, name, embedding=2560, architecture="qwen4exp"):
+        return self.gguf_meta(name, {"general.architecture": architecture, f"{architecture}.embedding_length": embedding})
+
+    def vision_file(self, name, projection=2560, encoder=True, size=0):
+        return self.gguf_meta(name, {"general.architecture": "clip", "clip.has_vision_encoder": encoder,
+                                     "clip.vision.projection_dim": projection}, size)
+
+    def projector_of(self, label):
+        found, _ = library.discover([self.models])
+        return next(m["projector"] for m in found if m["id"].startswith(label))
+
+    def test_vision_file_beside_the_weights_or_one_folder_up(self):
+        self.text_model("gemma/Gemma-Q.gguf", 2816, "gemma4")
+        beside = self.vision_file("gemma/mmproj.gguf", 2816)
+        # The published Qwen layout: each quant has a folder, with one vision file at the top of the repository.
+        self.text_model("repo/IQ1_M/Qwen-IQ1_M-00001-of-00002.gguf")
+        self.text_model("repo/IQ1_M/Qwen-IQ1_M-00002-of-00002.gguf")
+        above = self.vision_file("repo/mmproj-Qwen-BF16.gguf")
+        self.assertEqual(self.projector_of("Gemma-Q"), beside)
+        self.assertEqual(self.projector_of("Qwen-IQ1_M"), above)
+        found, _ = library.discover([self.models])
+        self.assertEqual(len(found), 2, "a vision file is never a model of its own")
+
+    def test_vision_file_that_cannot_work_is_ignored(self):
+        """A model that loads without images beats one the server refuses to start."""
+        self.text_model("a/Model.gguf", 2560)
+        self.vision_file("a/mmproj-other.gguf", 4096)  # would stop the model loading
+        self.vision_file("a/mmproj-audio.gguf", 2560, encoder=False)
+        self.gguf("a/mmproj-truncated.gguf")
+        self.assertIsNone(self.projector_of("Model"))
+        # Nor does a search climb out of the model's own repository into the library's top level.
+        self.text_model("b/Other.gguf", 2560)
+        self.vision_file("mmproj-unrelated.gguf", 2560)
+        self.assertIsNone(self.projector_of("Other"))
+
+    def test_vision_file_choice_among_several(self):
+        self.text_model("mix/Alpha-Q8.gguf")
+        self.text_model("mix/Beta-Q8.gguf")
+        alpha = self.vision_file("mix/mmproj-Alpha-Q8.gguf")
+        beta = self.vision_file("mix/mmproj-Beta-Q8.gguf")
+        self.assertEqual(self.projector_of("Alpha-Q8"), alpha)
+        self.assertEqual(self.projector_of("Beta-Q8"), beta)
+        self.text_model("prec/Gamma.gguf")
+        self.vision_file("prec/mmproj-Gamma-F32.gguf")
+        self.vision_file("prec/mmproj-Gamma-BF16.gguf")
+        preferred = self.vision_file("prec/mmproj-Gamma-F16.gguf")
+        self.assertEqual(self.projector_of("Gamma"), preferred)
+        self.text_model("bare/Delta.gguf")
+        self.vision_file("bare/mmproj-BF16.gguf")
+        preferred = self.vision_file("bare/mmproj-F16.gguf")
+        self.assertEqual(self.projector_of("Delta"), preferred)
+
+    def test_preset_starts_a_model_with_its_vision_file_and_room_for_it(self):
+        self.text_model("repo/IQ1_M/Qwen.gguf")
+        self.text_model("plain/Text.gguf")
+        vision = self.vision_file("repo/mmproj-Qwen.gguf", size=1024 * 1024 * 100)
+        data = self.root / "data"
+        config = {"model_dir": str(self.models), "gpu_headroom": 1024}
+
+        def sections(mode):
+            with patch.object(Path, "home", return_value=self.root):
+                library.prepare({**config, "memory_mode": mode}, data)
+            parsed = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+            parsed.read(data / "models.ini")
+            return {name.split("-")[0]: dict(parsed[name]) for name in parsed.sections() if name != "*"}
+
+        qwen, text = sections(0)["Qwen"], sections(0)["Text"]
+        link = Path(qwen["mmproj"])
+        self.assertTrue(link.is_symlink() and link.resolve() == vision.resolve())
+        self.assertEqual(qwen["fit-target"], "1174")  # the headroom, and the encoder's 100 MiB and working memory
+        self.assertEqual(text["fit-target"], "1024")
+        self.assertNotIn("mmproj", text)
+        self.assertEqual(sections(2)["Qwen"]["mmproj"], str(link))  # CPU only still reads images
+        # The file going away takes its link and its reserve with it, so the model still starts.
+        vision.unlink()
+        qwen = sections(0)["Qwen"]
+        self.assertNotIn("mmproj", qwen)
+        self.assertEqual(qwen["fit-target"], "1024")
+        self.assertFalse(link.is_symlink())
+
+    def test_vision_link_never_replaces_a_real_file(self):
+        self.text_model("a/Model.gguf")
+        self.vision_file("a/mmproj.gguf")
+        found, _ = library.discover([self.models])
+        protected = self.root / "data/models" / found[0]["id"] / "mmproj.gguf"
+        protected.parent.mkdir(parents=True)
+        protected.write_text("do not overwrite")
+        with patch.object(Path, "home", return_value=self.root), self.assertRaisesRegex(RuntimeError, "no model file was overwritten"):
+            library.prepare({"model_dir": str(self.models)}, self.root / "data")
+        self.assertEqual(protected.read_text(), "do not overwrite")
 
     def test_expert_cache_memory_limit(self):
         meminfo = self.root / "meminfo"
@@ -371,6 +492,73 @@ class LibraryTests(unittest.TestCase):
         (proc / "self").mkdir()
         self.assertEqual(library.process_memory("/srv/inferssd-server", 41000, proc), {"pid": 12, "rss_mib": 6000})
         self.assertIsNone(library.process_memory("/srv/inferssd-server", 9, proc))
+
+    def test_load_stage_follows_the_engines_log_order(self):
+        stages = [("", "starting"), ("build: 1\n", "starting"),
+                  ("load_tensors: loading model tensors, this can take a while... (mmap = true)\n", "reading"),
+                  ("load_tensors: offloaded 24/25 layers to GPU\n", "reading"),
+                  ("load_tensors:        ROCm0 model buffer size = 15000.00 MiB\n", "uploading"),
+                  ("llama_context: constructing llama_context\n", "context"),
+                  ("common_init_from_params: warming up the model with an empty run\n", "warming")]
+        log = ""
+        for line, stage in stages:
+            log += line
+            self.assertEqual(library.load_stage(log), stage, log)
+
+    def test_child_output_is_this_models_latest_process_without_its_port_tag(self):
+        logs = ("srv spawning server instance with name=a on port 41000\n[41000] old load\n"
+                "srv instance name=a exited with status 0\n"
+                "srv spawning server instance with name=b on port 41001\n[41001] other model\n"
+                "srv spawning server instance with name=a on port 41002\n"
+                "[41002] first\nnot tagged\n[41001] other again\n[41002]   indented\n")
+        self.assertEqual(library.child_output(logs, "a"), (41002, "first\n  indented"))
+        self.assertEqual(library.child_output(logs, "missing"), (None, ""))
+        self.assertEqual(library.child_output(logs + "instance name=a exited with status 1\n", "a"), (None, ""))
+
+    def test_upload_percent_counts_dots_the_log_has_not_received(self):
+        child = "line one\nline two é\n"
+        logged = len(child.encode())
+        self.assertEqual(library.upload_percent(child, f"rchar: 9\nwchar: {logged + 42}\n"), 42)
+        self.assertEqual(library.upload_percent(child, f"wchar: {logged}\n"), 0)
+        self.assertIsNone(library.upload_percent(child, f"wchar: {logged - 1}\n"))  # another writer: do not guess
+        self.assertIsNone(library.upload_percent(child, f"wchar: {logged + 500}\n"))
+        self.assertIsNone(library.upload_percent(child, "no counters here"))
+
+    def test_load_progress_reports_bytes_and_skips_lazily_mapped_shards(self):
+        folder = self.root / "data/models/qwen"
+        folder.mkdir(parents=True)
+        def shard(name, tensors, padding):
+            header = struct.pack("<4sIQQ", b"GGUF", 3, len(tensors), 0)
+            for tensor in tensors:
+                encoded = tensor.encode()
+                header += struct.pack("<Q", len(encoded)) + encoded + struct.pack("<IQIQ", 1, 8, 0, 0)
+            (folder / name).write_bytes(header + bytes(padding))
+        shard("model-00001-of-00002.gguf", ["blk.0.ffn_down.weight", "blk.0.attn.weight"], 3 * 2**20)
+        shard("model-00002-of-00002.gguf", ["blk.0.per_layer_token_embd.weight", "blk.1.per_layer_token_embd.weight"], 5 * 2**20)
+        proc = self.root / "proc"
+        (proc / "77").mkdir(parents=True)
+        child = "load_tensors: loading model tensors, this can take a while...\n"
+        process = {"pid": 77, "rss_mib": 2100, "file_mib": 1800, "anon_mib": 300}
+        report = library.load_progress(folder, child, process, proc)
+        self.assertEqual(report["phase"], "reading")
+        self.assertEqual(report["file_mib"], 8)
+        self.assertEqual(report["target_mib"], 3)  # the token tables are mapped, never read
+        self.assertEqual(report["mapped_mib"], 1800)
+        self.assertNotIn("upload_percent", report)
+        child += ("load_tensors:        ROCm0 model buffer size = 15000.00 MiB\n"
+                  "load_tensors:   CPU_Mapped model buffer size =  5000.00 MiB\n")
+        (proc / "77/io").write_text(f"wchar: {len(child.encode()) + 30}\n")
+        report = library.load_progress(folder, child, process, proc)
+        self.assertEqual(report["phase"], "uploading")
+        self.assertEqual(report["gpu_mib"], 15000)
+        self.assertEqual(report["upload_percent"], 30)
+        # A model in one file, an unreadable process and an empty folder all still report.
+        (folder / "model-00002-of-00002.gguf").unlink()
+        report = library.load_progress(folder, child, {"pid": 99}, proc)
+        self.assertEqual(report["target_mib"], report["file_mib"])
+        self.assertNotIn("upload_percent", report)
+        self.assertEqual(library.load_progress(self.root / "gone", "", None, proc),
+                         {"phase": "starting", "file_mib": 0, "target_mib": 0, "gpu_mib": 0})
 
     def test_live_status_reads_only_current_invocation_without_loading_model(self):
         config_dir = self.root / "config/chela"

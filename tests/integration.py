@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 PROPOSED_FILE = "# Example\n```c\nint main(void) { return 0; }\n```\n"
@@ -18,6 +19,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith("/props?"):
+            query = parse_qs(urlsplit(self.path).query)
+            assert query["autoload"] == ["false"], self.path  # asking must never load a model
+            if query["model"] == ["running model/q8"]:
+                self.reply({"default_generation_settings": {"n_ctx": 4096}, "modalities": {"vision": True, "audio": False}})
+            else:
+                self.reply({"error": {"code": 400, "message": "model is not running", "type": "invalid_request_error"}}, 400)
+            return
         if self.path == "/v1/library/models":
             self.reply({"data": [{"id": "qwen-q8", "status": {"value": "unloaded"}},
                                  {"id": "qwen-q6", "status": {"value": "loaded"}},
@@ -94,6 +103,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if model == "http-error":
             self.reply({"error": {"message": "unknown model"}}, 404)
+            return
+        if model == "no-vision":
+            self.reply({"error": {"code": 400, "type": "invalid_request_error", "message":
+                                  "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"}}, 400)
+            return
+        if model == "context-full":
+            self.reply({"error": {"code": 400, "type": "exceed_context_size_error", "n_prompt_tokens": 9000, "n_ctx": 8192,
+                                  "message": "the request exceeds the available context size, try increasing it"}}, 400)
             return
         if model in ("workspace-chat", "chat-deny") or "inspect this project" in last_user:
             assert {t["function"]["name"] for t in data["tools"]} == {"list_files", "read_file"}

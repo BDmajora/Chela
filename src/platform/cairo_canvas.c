@@ -497,6 +497,40 @@ static void cc_stroke_path(CuCanvas *c, float width, CuColor color) {
     cairo_set_line_join(c->cr, CAIRO_LINE_JOIN_ROUND);
     cairo_stroke(c->cr);
 }
+struct CuImage {
+    cairo_surface_t *surface;
+    uint32_t *pixels;
+    int width, height;
+};
+static CuImage *cc_image_new(const uint32_t *pixels, int width, int height) {
+    CuImage *image = ch_new0(CuImage, 1);
+    size_t bytes = (size_t)width * (size_t)height * 4;
+    image->pixels = ch_alloc(bytes);
+    memcpy(image->pixels, pixels, bytes);
+    image->width = width;
+    image->height = height;
+    image->surface = cairo_image_surface_create_for_data((unsigned char *)image->pixels, CAIRO_FORMAT_ARGB32, width,
+                                                         height, width * 4);
+    return image;
+}
+static void cc_image_free(CuImage *image) {
+    if (image) {
+        cairo_surface_destroy(image->surface);
+        free(image->pixels);
+        free(image);
+    }
+}
+static void cc_draw_image(CuCanvas *c, CuImage *image, CuRect r, float radius) {
+    cairo_save(c->cr);
+    rounded(c->cr, r, radius);
+    cairo_clip(c->cr);
+    cairo_translate(c->cr, r.x, r.y);
+    cairo_scale(c->cr, (double)r.w / image->width, (double)r.h / image->height);
+    cairo_set_source_surface(c->cr, image->surface, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(c->cr), CAIRO_FILTER_GOOD);
+    cairo_paint(c->cr);
+    cairo_restore(c->cr);
+}
 void cc_install(CuPlatform *p) {
     p->font_get = font_get;
     p->font_metrics = font_metrics;
@@ -515,6 +549,9 @@ void cc_install(CuPlatform *p) {
     p->fill_path = cc_fill_path;
     p->stroke_path = cc_stroke_path;
     p->draw_text = draw_text;
+    p->image_new = cc_image_new;
+    p->image_free = cc_image_free;
+    p->draw_image = cc_draw_image;
 }
 void cc_shutdown(void) {
     for (int i = 0; i < font_count; i++) {

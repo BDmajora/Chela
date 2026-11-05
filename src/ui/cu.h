@@ -37,7 +37,7 @@ typedef struct {
     uint8_t align_x, align_y; /* child alignment within free space */
     CuColor bg, border_color;
     float radius, border;
-    float border_b, border_t, border_r; /* single-side rules */
+    float border_b, border_t, border_r, border_l; /* single-side rules */
     bool clip, scroll_y;
     bool interactive;        /* hit-testable: hover, press, click */
     bool focusable;          /* reachable with Tab; Enter/Space activate */
@@ -47,6 +47,8 @@ typedef struct {
     const char *tooltip;
     float opacity;           /* 0 = opaque; otherwise multiplies colours in this subtree */
     float shadow;            /* soft drop shadow radius for floating panels */
+    void (*paint)(Cu *cu, CuCanvas *canvas, CuRect rect, void *data); /* custom background, under the children */
+    void *paint_data;
 } CuBox;
 #define CU_PAD(v) .pad_l = (v), .pad_t = (v), .pad_r = (v), .pad_b = (v)
 #define CU_PAD2(y, x) .pad_l = (x), .pad_t = (y), .pad_r = (x), .pad_b = (y)
@@ -69,10 +71,14 @@ typedef struct {
     size_t length; /* SIZE_MAX = strlen */
     CuFont *font;
     CuColor color, bg;
+    bool underline, strike;
+    const char *link; /* clicking the span reports this through cu_link_take */
 } CuSpan;
 typedef struct {
     float indent, hanging, line_height, space_after;
     bool selectable, preformatted; /* preformatted keeps spaces and breaks long lines anywhere */
+    bool tight;                    /* copied with single line breaks, as in the rows of a table */
+    uint8_t align;
 } CuPara;
 
 /* Text editing state owned by the application. */
@@ -91,6 +97,7 @@ typedef struct CuEdit {
     float desired_x;
     int64_t last_undo;
     int undo_kind;
+    bool reveal_caret; /* the caret moved, so scroll it into view */
 } CuEdit;
 void cu_edit_init(CuEdit *e, bool multiline);
 void cu_edit_clear(CuEdit *e);
@@ -106,13 +113,14 @@ typedef struct {
     float min_h, max_h; /* multi-line: grows with content between these */
     bool submit_on_enter, disabled;
     size_t max_length;
+    bool accept_data; /* pasted files and images arrive through cu_payload_take */
 } CuEditStyle;
 enum { CU_EDIT_CHANGED = 1, CU_EDIT_SUBMIT = 2 };
 
 typedef void (*CuPaintFn)(Cu *cu, CuCanvas *canvas, CuRect rect, void *data);
 
 typedef enum { CU_LAYER_POPUP, CU_LAYER_MODAL, CU_LAYER_TOOLTIP } CuLayerKind;
-enum { CU_PLACE_BELOW, CU_PLACE_ABOVE, CU_PLACE_RIGHT, CU_PLACE_CENTER, CU_PLACE_POINT };
+enum { CU_PLACE_BELOW, CU_PLACE_ABOVE, CU_PLACE_RIGHT, CU_PLACE_LEFT, CU_PLACE_CENTER, CU_PLACE_POINT };
 typedef struct {
     CuLayerKind kind;
     CuId anchor;          /* element whose rect places the layer */
@@ -184,15 +192,32 @@ void cu_focus(Cu *cu, CuId id);
 CuId cu_focus_id(Cu *cu);
 bool cu_key(Cu *cu, int key, int mods); /* consumes a matching key press this frame */
 bool cu_key_any(Cu *cu, int key);       /* consumes the key with any modifiers */
+bool cu_typed(Cu *cu, int ch);          /* consumes this ASCII character being typed, in either case */
+int cu_mods(Cu *cu);                    /* modifiers held at the last input */
 float cu_mouse_x(Cu *cu);
 float cu_mouse_y(Cu *cu);
 void cu_scroll_to(Cu *cu, CuId id, float y); /* use INFINITY for the end */
+void cu_scroll_by(Cu *cu, CuId id, float dy); /* as if the user scrolled it */
 float cu_scroll_y(Cu *cu, CuId id);
+float cu_scroll_target(Cu *cu, CuId id); /* where it is heading: a scroll not yet laid out counts */
 float cu_scroll_max(Cu *cu, CuId id);
 bool cu_scrolled_by_user(Cu *cu, CuId id); /* the user scrolled this element this frame */
 void cu_copy(Cu *cu, const char *text);
-const char *cu_selection_text(Cu *cu); /* selected transcript text, or NULL */
+char *cu_link_take(Cu *cu); /* a link that was clicked, once; the caller frees it */
+/* Files and images pasted or dropped onto the window, oldest first. */
+typedef struct {
+    char *mime, *data;
+    size_t size;
+    bool dropped;
+} CuPayload;
+bool cu_payload_take(Cu *cu, CuPayload *payload);
+void cu_payload_clear(CuPayload *payload);
+bool cu_drag_active(Cu *cu); /* something droppable is over the window */
+/* Selectable text is selected by dragging across as many elements as it takes, by double
+ * or triple click, or with Ctrl+A; Ctrl+C copies it. Both work in dialogs too. */
+const char *cu_selection_text(Cu *cu); /* the selected text, or NULL */
 void cu_clear_selection(Cu *cu);
+bool cu_selecting(Cu *cu); /* a selection is being dragged */
 
 /* Fonts and text measurement. */
 CuFont *cu_font(Cu *cu, const char *family, float size, int weight);

@@ -3,10 +3,12 @@
  *
  * Script lines (CHELA_HEADLESS_SCRIPT=file, or --script file):
  *   size W H | scale S | wait MS | idle | move X Y | click X Y [BUTTON] | dblclick X Y
- *   rclick X Y | press X Y | release X Y | scroll X Y DY | key [ctrl+][shift+][alt+]NAME
- *   type TEXT | tap TEXT (click the element showing TEXT) | rtap TEXT | hover TEXT
+ *   tripleclick X Y | rclick X Y | press X Y | release X Y | scroll X Y DY | key [ctrl+][shift+][alt+]NAME
+ *   type TEXT | tap TEXT (click the element showing TEXT) | rtap TEXT | ctap TEXT (with Ctrl held) | hover TEXT
  *   expect TEXT | expect-not TEXT | until TEXT | until-not TEXT | shot PATH | clipboard TEXT
- *   dump | log MESSAGE | quit
+ *   copy-data MIME PATH (the clipboard then offers that file's bytes as MIME)
+ *   copy-text TEXT | drag on|off | drop MIME PATH | drop-files PATH… | dump | log MESSAGE | quit
+ *   clipboard-get (reports the clipboard) | place TEXT (reports "X Y W H" of the element showing TEXT)
  * expect checks once the interface is idle; until waits up to 20 s, for work such as
  * a server's reply. A failed expectation exits with status 3.
  *
@@ -62,6 +64,8 @@ static struct {
     bool quit;
     int status;
     char *clipboard;
+    char *clip_mime, *clip_data; /* a non-text clipboard, from copy-data */
+    size_t clip_size;
     char *script;
     HeadlessFinder finder;
     HeadlessLister lister;
@@ -228,7 +232,18 @@ static void timer_remove(unsigned id) {
 static void clipboard_set(CuWindow *w, const char *text) {
     (void)w;
     free(hl.clipboard);
+    ch_clear_pointer(&hl.clip_mime, free);
+    ch_clear_pointer(&hl.clip_data, free);
     hl.clipboard = ch_strdup(text);
+}
+static void clipboard_request_data(CuWindow *w, void (*cb)(const char *, const void *, size_t, void *), void *data) {
+    (void)w;
+    if (hl.clip_mime)
+        cb(hl.clip_mime, hl.clip_data, hl.clip_size, data);
+    else if (hl.clipboard)
+        cb("text/plain", hl.clipboard, strlen(hl.clipboard), data);
+    else
+        cb(NULL, NULL, 0, data);
 }
 static void clipboard_request(CuWindow *w, void (*cb)(const char *, void *), void *data) {
     (void)w;
@@ -400,6 +415,11 @@ static void click(float x, float y, int button, int count) {
         pointer(CU_EV_RELEASE, x, y, button);
     }
 }
+static void control_click(float x, float y) {
+    pointer(CU_EV_MOTION, x, y, 0);
+    deliver((CuEvent){.type = CU_EV_PRESS, .x = x, .y = y, .button = 1, .mods = CU_MOD_CTRL});
+    deliver((CuEvent){.type = CU_EV_RELEASE, .x = x, .y = y, .button = 1, .mods = CU_MOD_CTRL});
+}
 static void step(char *line) {
     char *cmd = line, *rest = strchr(line, ' ');
     if (rest)
@@ -430,6 +450,8 @@ static void step(char *line) {
         click(a, b, c > 0 ? (int)c : 1, 1);
     else if (!strcmp(cmd, "dblclick") && sscanf(rest, "%f %f", &a, &b) == 2)
         click(a, b, 1, 2);
+    else if (!strcmp(cmd, "tripleclick") && sscanf(rest, "%f %f", &a, &b) == 2)
+        click(a, b, 1, 3);
     else if (!strcmp(cmd, "rclick") && sscanf(rest, "%f %f", &a, &b) == 2)
         click(a, b, 3, 1);
     else if (!strcmp(cmd, "press") && sscanf(rest, "%f %f", &a, &b) == 2)
@@ -455,7 +477,7 @@ static void step(char *line) {
                 memmove(p + 1, p + 2, strlen(p + 2) + 1);
             }
         deliver((CuEvent){.type = CU_EV_TEXT, .text = rest});
-    } else if (!strcmp(cmd, "tap") || !strcmp(cmd, "rtap") || !strcmp(cmd, "hover")) {
+    } else if (!strcmp(cmd, "tap") || !strcmp(cmd, "rtap") || !strcmp(cmd, "ctap") || !strcmp(cmd, "hover")) {
         CuRect r;
         if (!find(rest, &r)) {
             fail(rest, "no element shows this text");
@@ -464,6 +486,8 @@ static void step(char *line) {
         float x = r.x + r.w / 2, y = r.y + r.h / 2;
         if (!strcmp(cmd, "hover"))
             pointer(CU_EV_MOTION, x, y, 0);
+        else if (cmd[0] == 'c')
+            control_click(x, y);
         else
             click(x, y, cmd[0] == 'r' ? 3 : 1, 1);
     } else if (!strcmp(cmd, "expect") || !strcmp(cmd, "expect-not")) {
@@ -487,9 +511,57 @@ static void step(char *line) {
         CuWindow *w = top();
         if (!w || !snapshot(w, rest))
             fail(rest, "cannot write screenshot");
+    } else if (!strcmp(cmd, "copy-text")) {
+        ch_clear_pointer(&hl.clip_mime, free);
+        ch_clear_pointer(&hl.clip_data, free);
+        free(hl.clipboard);
+    free(hl.clip_mime);
+    free(hl.clip_data);
+    hl.clip_mime = hl.clip_data = NULL;
+        hl.clipboard = ch_strdup(rest);
+    } else if (!strcmp(cmd, "copy-data") || !strcmp(cmd, "drop")) {
+        char *path = strchr(rest, ' '), *bytes = NULL;
+        size_t size = 0;
+        if (path)
+            *path++ = 0;
+        if (!path || !ch_file_get_contents(path, &bytes, &size, NULL))
+            fail(rest, "needs a MIME type and a readable file");
+        else if (!strcmp(cmd, "drop"))
+            deliver((CuEvent){.type = CU_EV_DROP, .mime = rest, .data = bytes, .size = size});
+        else {
+            free(hl.clip_mime);
+            free(hl.clip_data);
+            hl.clip_mime = ch_strdup(rest);
+            hl.clip_data = ch_steal(&bytes);
+            hl.clip_size = size;
+        }
+        free(bytes);
+    } else if (!strcmp(cmd, "drop-files")) {
+        ChBuf uris;
+        ch_buf_init(&uris);
+        char **paths = ch_strsplit(rest, " ");
+        for (size_t i = 0; paths[i]; i++)
+            ch_buf_printf(&uris, "file://%s\r\n", paths[i]);
+        ch_strfreev(paths);
+        deliver((CuEvent){.type = CU_EV_DROP, .mime = "text/uri-list", .data = uris.str, .size = uris.len});
+        ch_buf_clear(&uris);
+    } else if (!strcmp(cmd, "drag")) {
+        deliver((CuEvent){.type = CU_EV_DRAG, .focused = !strcmp(rest, "on"), .x = hl.mouse_x, .y = hl.mouse_y});
     } else if (!strcmp(cmd, "clipboard")) {
         if (ch_strcmp0(hl.clipboard, rest))
             fail(rest, "clipboard differs");
+    } else if (!strcmp(cmd, "clipboard-get")) {
+        settle();
+        emit_text(hl.clipboard ? hl.clipboard : "", NULL);
+    } else if (!strcmp(cmd, "place")) {
+        settle();
+        CuRect r;
+        if (find(rest, &r)) {
+            char *where = ch_strdup_printf("%.1f %.1f %.1f %.1f", r.x, r.y, r.w, r.h);
+            emit_text(where, NULL);
+            free(where);
+        } else
+            fail(rest, "no element shows this text");
     } else if (!strcmp(cmd, "dump")) {
         settle();
         if (hl.lister)
@@ -554,6 +626,9 @@ static void run(void) {
 }
 static void shutdown_backend(void) {
     free(hl.clipboard);
+    free(hl.clip_mime);
+    free(hl.clip_data);
+    hl.clip_mime = hl.clip_data = NULL;
     free(hl.script);
     hl.clipboard = hl.script = NULL;
     if (hl.control >= 0) {
@@ -568,7 +643,7 @@ int headless_status(void) {
 }
 static bool no_csd(CuWindow *w) {
     (void)w;
-    return false;
+    return ch_getenv("CHELA_HEADLESS_CSD") != NULL; /* to review the window buttons */
 }
 const CuPlatform *cu_platform_headless(void) {
     static CuPlatform p;
@@ -591,6 +666,7 @@ const CuPlatform *cu_platform_headless(void) {
         p.timer_remove = timer_remove;
         p.clipboard_set = clipboard_set;
         p.clipboard_request = clipboard_request;
+        p.clipboard_request_data = clipboard_request_data;
         p.window_snapshot = snapshot;
         cc_install(&p);
     }

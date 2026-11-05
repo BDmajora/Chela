@@ -70,7 +70,7 @@ void dictate(App *a) {
         ch_clear_error(&error);
         return;
     }
-    ChSpawn spawn = {.argv = (const char *const *)argv, .cwd = a->project,
+    ChSpawn spawn = {.argv = (const char *const *)argv, .cwd = a->code && *a->project ? a->project : NULL,
                      .flags = CH_PROC_STDOUT | CH_PROC_STDERR_SILENCE | CH_PROC_NEW_SESSION | CH_PROC_SEARCH_PATH};
     ChProc *proc = ch_proc_spawn(&spawn, &error);
     ch_strfreev(argv);

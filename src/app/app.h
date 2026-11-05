@@ -9,6 +9,7 @@
 
 /* October 2026 desktop surfaces, in logical pixels at 100% scale. */
 #define SIDEBAR_W 280 /* the reference frame: a full-height 280px sidebar */
+#define PANEL_W 262   /* the Code session's environment panel */
 #define C_BG 0xff191919
 #define C_SIDEBAR 0xff1f1f1f
 #define C_BORDER 0xff333333
@@ -33,8 +34,16 @@
 #define C_CHECK 0xff72a4ec
 #define C_DANGER 0xffe39182
 #define C_OK 0xff7dbf7f
+#define C_METER_BLUE C_CHECK
+#define C_METER_YELLOW 0xffe6c04e
+#define C_METER_RED 0xffe5534b
 #define C_CODE_BG 0xff242424
-#define C_INLINE_CODE 0xff383838
+#define C_INLINE_CODE 0xff333333
+#define C_CODE_BORDER 0xff353535
+#define C_QUOTE 0xff4f4f4f
+#define C_LINK 0xff8fb7f0
+#define C_ADDED 0xff7dbf7f
+#define C_REMOVED 0xffe0746a
 #define C_SCRIM 0x80000000
 
 extern const char *const providers[7];
@@ -54,9 +63,7 @@ enum {
     MENU_PROJECT,
     MENU_MODEL,
     MENU_MODE,
-    MENU_THINKING,
     MENU_ATTACH,
-    MENU_VOICE,
     MENU_ENVIRONMENT,
     MENU_SESSION,
     MENU_ROW,
@@ -65,21 +72,27 @@ enum {
     MENU_PROFILE,
     MENU_MORE,
     MENU_MODEL_PANEL,
+    MENU_GROUP,
+    MENU_SELECTION,
 };
 #define MENU_ITEMS 64
 typedef struct {
     int kind;
     CuId anchor;
     bool align_end, above;
+    /* A context menu opens where the pointer is, and is about one session or folder. */
+    bool at_pointer;
+    float x, y;
+    char *target;
     int sub[4];
     int level, index[4];
     CuId layer[4];
     /* Keyboard navigation: the highlighted item per level (-1 none, -2 the first enabled
      * one once built), and last frame's items, deepest open level and pointer. */
     int cursor[4], count[4], depth, activate_level, activate_index;
-    uint8_t flags[4][MENU_ITEMS];
-    float mouse_x, mouse_y;
-    bool moved;
+    uint8_t flags[4][MENU_ITEMS], keys[4][MENU_ITEMS]; /* keys: the letter or digit a row shows, which chooses it */
+    float mouse_x, mouse_y, mouse_dx;
+    bool moved, keyed; /* keyed: a key moved the highlight this frame */
     /* Model discovery for the model picker. */
     json_object *models;
     char *models_error;
@@ -104,7 +117,13 @@ struct App {
     CuWindow *window;
     ChConfig config;
     ChStore *store;
-    char *config_path, *preferences_path, *project, *id, *session_title, *filter_project, *setup_host;
+    char *config_path, *preferences_path, *id, *session_title, *setup_host;
+    char *project; /* the Code tab's working folder; empty when there is none. Chat never uses it. */
+    char *launch_project; /* named on the command line: new sessions start there, otherwise blank */
+    ChVec folders; /* folders also included in the Code session, as absolute paths */
+    /* Chat and Code keep their own place: the session open there and what was being written. */
+    char *tab_session[2], *tab_draft[2];
+    ChVec tab_attachments; /* the other tab's */
     bool setup_at_launch; /* the next model library setup was opened by --setup-models */
     char *dictation_command;
     ChVec *rows; /* visible sessions in display order */
@@ -113,16 +132,20 @@ struct App {
     bool search_open;
     bool busy, code, closing, follow, sidebar_hidden;
     bool group_projects, group_dates, group_environment, sort_titles;
-    int filter_type, activity_days;
+    int activity_days;
     ChInteraction code_interaction, interaction;
-    ChMode mode;
+    ChMode mode, default_mode;  /* default_mode: the last one chosen, which new sessions start in */
+    bool bypass_enabled;        /* Bypass permissions has been turned on, so it is on offer */
     ChMap pinned, session_sections, load_seconds; /* id → NULL, id → section name, model → double* */
+    ChMap selection;            /* sessions marked in the sidebar, id → NULL */
     ChVec sections;
+    ChVec project_order;        /* folders moved in the sidebar, first to last; the rest go above them */
+    ChVec *doomed;              /* sessions whose deletion is waiting to be confirmed */
     bool pinned_collapsed, recents_collapsed;
-    int interface_font, response_font, text_size, transcript_width, motion;
+    int interface_font, response_font, text_size, transcript_width;
     /* Status and recovery */
     char *status, *stopped_note; /* stopped_note: why the last request ended, shown under the transcript */
-    bool status_visible, recovery_visible, retry_enabled;
+    bool status_visible, recovery_visible;
     /* Request */
     Job *job;
     ChCancel *cancel;
@@ -137,14 +160,17 @@ struct App {
     bool health_pending;
     /* Model residency (model.c) */
     char *model_state, *model_status_for, *model_status_error, *load_error, *device_error;
+    ChLoadTrack load;
+    ChMap load_tail, load_mapped; /* model → double*, from its last load */
     json_object *device_status;
     ChCancel *model_cancel;
     int idle_unload_seconds;
     double last_load_seconds;
-    bool keep_loaded, model_router, model_poll_pending, device_poll_pending, model_control_pending;
-    bool unload_requested, load_observed_late;
+    bool preload, model_router, model_poll_pending, device_poll_pending, model_control_pending;
+    bool unload_requested, load_observed_late, idle_unloaded, props_pending, props_checked;
+    ChModelInfo model_listed, model_running; /* from the model list; from /props of the running model */
     int64_t load_started_us, load_requested_us, load_ready_us, model_idle_since, last_model_poll, last_device_poll,
-        last_auto_load;
+        last_auto_load, details_seen_us;
     /* SSH tunnel and dictation */
     ChTunnel *tunnel;
     char *tunnel_error;
@@ -159,9 +185,29 @@ struct App {
     unsigned approval_dialog;
     int active_jobs;
     unsigned tick_timer, flush_timer;
-    bool feedback[2048];
+    uint8_t feedback[2048];
     struct MdCache *md;
     size_t md_count;
+    CuId copied_id; /* what was just copied, to show a check for a moment */
+    int64_t copied_at;
+    /* Attachments of the message being written (attach_ui.c) */
+    ChVec attachments;
+    char *attachment_folder;
+    int attach_pending;
+    unsigned attach_generation, attach_order;
+    ChMap thumbs;
+    int64_t status_until; /* a passing note hides itself at this time */
+    /* Code session panel and git (panel.c) */
+    bool panel_open, git_pending, git_switching;
+    char *git_branch;   /* the current branch, or a detached HEAD's commit; NULL outside a repository */
+    ChVec git_branches; /* "name\tworktree" per local branch, last committed first; read for the folder menu */
+    int git_added, git_removed, git_files;
+    int64_t last_git_poll;
+    /* The Worktree box: new Code sessions in a repository get a worktree of their own. */
+    bool use_worktree, worktree_pending;
+    /* Deleting a session: the box in its confirmation, and the removal once it runs. */
+    bool remove_worktree, worktree_removing;
+    char *worktree_root;
 };
 
 /* app.c */
@@ -172,8 +218,13 @@ void app_start_new(App *a);
 void app_select_session(App *a, const char *id);
 void app_save_session(App *a);
 void app_send(App *a, bool retry);
+void app_retry(App *a); /* picks a stopped request up again from where it failed */
+bool app_images_refused(App *a); /* the draft has images this model cannot read */
 void app_stop(App *a);
-void app_set_project(App *a, const char *path, bool new_session);
+void app_set_project(App *a, const char *path); /* a session in that folder; "" for no folder */
+void app_add_folder(App *a, const char *path);  /* lets the agent into another folder as well */
+void app_remove_folder(App *a, size_t index);
+void app_choose_folder(App *a);
 void app_set_code(App *a, bool code);
 void app_set_interaction(App *a, ChInteraction interaction);
 void app_set_mode(App *a, ChMode mode);
@@ -183,14 +234,27 @@ void app_toggle_sidebar(App *a);
 void app_focus_search(App *a);
 void app_navigate(App *a, int direction);
 void app_attach_file(App *a);
-void app_attach_path(App *a, const char *path);
+void app_note(App *a, const char *text); /* a short message above the composer that hides itself */
+void app_open_url(App *a, const char *url);
+void app_launch(App *a, const char *target);
+bool app_panel_visible(App *a);
 void app_export(App *a);
 void app_choose_project(App *a);
 void app_delete_session(App *a);
+void app_forget_session(App *a); /* deletes the current session straight away */
 void app_rename_session(App *a);
-void app_toggle_pin(App *a);
-void app_move_to_section(App *a, const char *section);
+void app_toggle_pin(App *a, const char *id);
+void app_move_to_section(App *a, const char *id, const char *section);
 void app_create_section(App *a, bool move_session);
+/* Several sessions at once, from the sidebar. ids is the caller's. */
+void app_archive_sessions(App *a, ChVec *ids);
+void app_delete_sessions(App *a, ChVec *ids, const char *where); /* asks first */
+ChVec *app_project_groups(App *a); /* the folders headed in the sidebar, top first */
+ChVec *app_project_sessions(App *a, const char *project); /* the ids listed under one */
+void app_move_project(App *a, const char *project, int direction);
+void app_select_project(App *a, const char *project);
+ChVec *app_selected_sessions(App *a); /* the ids marked */
+void app_clear_selection(App *a);
 void app_view_all(App *a);
 void app_show_changes(App *a);
 void app_regenerate(App *a, size_t index);
@@ -219,11 +283,15 @@ bool ui_flat_button(App *a, CuId id, const char *icon, const char *text, const c
                     CuColor color, const char *tooltip, bool enabled, float max_text);
 bool ui_button(App *a, CuId id, const char *text, bool enabled, bool primary);
 bool ui_checkbox(App *a, CuId id, const char *text, bool *value, bool enabled);
+bool ui_flat_check(App *a, CuId id, const char *text, bool *value, float size, CuColor color, const char *tooltip,
+                   bool enabled);
 bool ui_switch(App *a, CuId id, bool *value, bool enabled);
+void ui_switch_mark(App *a, bool on, bool enabled);
 bool ui_dropdown(App *a, CuId id, const char *const *choices, int count, int *value, bool enabled, bool flat);
 bool ui_spin(App *a, CuId id, CuEdit *edit, double min, double max, double step, int digits, bool enabled);
 int ui_entry(App *a, CuId id, CuEdit *edit, const char *placeholder, bool enabled, size_t max_length);
 void ui_progress(App *a, CuId id, double fraction, float width);
+void ui_meter(App *a, CuId id, double fraction, CuColor color);
 void ui_spinner(App *a, float size);
 void ui_separator(App *a, float margin);
 bool ui_expander(App *a, CuId id, const char *title, bool *expanded);
@@ -236,12 +304,14 @@ void ui_spin_set(CuEdit *edit, double value, int digits);
 
 /* menus.c */
 void menu_open(App *a, int kind, CuId anchor, bool align_end);
+void menu_open_here(App *a, int kind, CuId anchor, const char *target);
 void menu_close(App *a);
 void menu_build(App *a);
 void menu_keys(App *a);
 bool menu_item(App *a, const char *icon, const char *title, const char *detail, const char *trailing, bool enabled,
                const char *tooltip);
 bool menu_item_destructive(App *a, const char *icon, const char *title, const char *trailing, bool enabled);
+bool menu_switch(App *a, const char *title, const char *tooltip, bool on, bool enabled);
 bool menu_sub_begin(App *a, const char *icon, const char *title, const char *trailing, bool enabled, const char *tooltip);
 void menu_sub_end(App *a);
 void menu_heading(App *a, const char *text);
@@ -256,6 +326,8 @@ void dialogs_free(App *a);
 bool dialog_frame_begin(App *a, Dialog *d, const char *title, float width, float height);
 void dialog_frame_end(App *a);
 bool dialog_footer_buttons(App *a, Dialog *d, const char *cancel, const char *accept, bool accept_enabled, int *choice);
+void dialog_confirm_option(App *a, const char *title, const char *text, const char *accept, const char *option,
+                           const char *detail, bool *checked, void (*callback)(App *, void *), void *data);
 void dialog_confirm(App *a, const char *title, const char *text, const char *accept, bool destructive,
                     void (*callback)(App *a, void *data), void *data);
 void dialog_text_input(App *a, const char *title, const char *initial, const char *placeholder, const char *accept,
@@ -270,18 +342,46 @@ void open_voice_settings(App *a);
 void open_all_sessions(App *a);
 void open_shortcuts(App *a);
 void open_about(App *a);
+void open_image(App *a, const char *path, const char *name);
 unsigned open_approval(App *a, Job *job);
 void close_approval(App *a);
 unsigned open_listening(App *a);
 
-/* sidebar.c, chat.c, composer.c */
+/* Settings pages, in open_settings order. */
+enum { SETTINGS_GENERAL, SETTINGS_CONNECTIONS, SETTINGS_MODELS };
+
+/* attach_ui.c: files and images on the message being written and in the transcript. */
+void attachments_init(App *a);
+void attachments_clear(App *a);
+void attachments_swap(App *a, ChVec *other); /* the draft of the other tab comes back */
+void attachments_free(App *a);
+void attachments_take_payloads(App *a); /* pasted and dropped data */
+void attach_path(App *a, const char *path);
+void attachments_row(App *a);
+void attachment_sent(App *a, CuId id, json_object *attachment);
+json_object *attachments_json(App *a);
+void attachments_forget(App *a, json_object *messages); /* after a session is deleted */
+CuImage *thumb_image(App *a, const char *path, int side, int *width, int *height);
+
+/* sidebar.c, chat.c, composer.c, panel.c */
 void sidebar_build(App *a);
+void sidebar_fold_all(App *a, bool fold);
+bool sidebar_can_fold(App *a, bool fold); /* something is left to fold, or to unfold */
 void topbar_build(App *a);
 void chat_build(App *a);
 void welcome_build(App *a);
 void composer_build(App *a);
 float content_width(App *a);
 void md_cache_clear(App *a);
+void panel_build(App *a);
+ChVec *recent_projects(App *a, size_t limit);
+void git_poll(App *a);                                /* keeps the git figures current, off the UI thread */
+void git_switch_branch(App *a, const char *branch);   /* refused while there are uncommitted changes */
+void git_worktree_create(App *a);                     /* then sends the draft from the new worktree */
+bool git_in_worktree(App *a, const char *path);       /* in a worktree Chela made for a session */
+char *git_worktree_origin(App *a, const char *path);  /* the repository of that worktree; NULL if it has gone */
+bool git_worktree_removable(App *a);                  /* this session's worktree is there, and only this session uses it */
+void git_worktree_remove(App *a);                     /* then deletes the session, unless the worktree holds work */
 
 /* model.c */
 void model_tick(App *a);
@@ -290,8 +390,13 @@ void model_used(App *a);
 void model_state_apply(App *a, const char *model, json_object *models, const ChError *error);
 void model_load(App *a, bool automatic);
 void model_unload(App *a, bool user);
+void model_preload_set(App *a, bool on);
+bool model_preload_enabled(App *a);
+const char *model_preload_hint(App *a);
+void model_preload_row(App *a);
+void model_details_build(App *a);
 bool model_chip_visible(App *a);
-void model_chip_build(App *a, float content);
+char *model_status_summary(App *a);
 void model_card_build(App *a);
 void model_panel_build(App *a);
 const char *model_state_name(const char *state);
@@ -300,7 +405,19 @@ const char *model_backend(App *a);
 char *model_memory_text(App *a);
 char *model_live_text(App *a, bool busy_only);
 char *model_slot_text(App *a, bool streamed);
-char *model_eta_text(App *a, double *fraction);
+char *model_eta_text(App *a, double *fraction); /* "42% · 1m 12s left", with the bar's position */
+char *model_phase_text(App *a);
+void model_progress_build(App *a);
+/* How full the context is, in the server's numbers. limit is 0 when the server does not say. */
+typedef struct {
+    long long prompt, reply, used;
+    int limit;
+    double fraction;
+} ModelContext;
+ModelContext model_context(App *a);
+void model_context_build(App *a);
+CuColor model_context_color(double fraction);
+int model_vision(App *a); /* 1 reads images, 0 does not, -1 unknown */
 char *format_clock(int64_t microseconds);
 bool model_control_supported(App *a);
 

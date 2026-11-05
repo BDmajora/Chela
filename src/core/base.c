@@ -1102,3 +1102,34 @@ bool ch_thread_run(ChThreadFn fn, void *data) {
     }
     return true;
 }
+
+/* Which of a clipboard offer's MIME types to read. */
+static int image_rank(const char *mime) {
+    static const char *const order[] = {"image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/tiff"};
+    for (size_t i = 0; i < CH_N_ELEMENTS(order); i++)
+        if (!strcmp(mime, order[i]))
+            return (int)i;
+    return -1;
+}
+static bool text_mime(const char *mime) {
+    return !strcmp(mime, "text/plain;charset=utf-8") || !strcmp(mime, "text/plain") || !strcmp(mime, "UTF8_STRING") ||
+           !strcmp(mime, "TEXT") || !strcmp(mime, "STRING");
+}
+int ch_clipboard_best(const char *const *mimes, int count) {
+    int uri = -1, gnome = -1, text = -1, image = -1, best = 99;
+    for (int i = 0; i < count; i++) {
+        if (!strcmp(mimes[i], "text/uri-list"))
+            uri = i;
+        else if (!strcmp(mimes[i], "x-special/gnome-copied-files"))
+            gnome = i;
+        else if (text_mime(mimes[i]) && (text < 0 || !strcmp(mimes[i], "text/plain;charset=utf-8")))
+            text = i;
+        else if (image_rank(mimes[i]) >= 0 && image_rank(mimes[i]) < best) {
+            best = image_rank(mimes[i]);
+            image = i;
+        }
+    }
+    /* Copied files first; then text, because spreadsheets also offer a picture of the
+     * selected cells. A picture copied from a browser comes with HTML but no plain text. */
+    return uri >= 0 ? uri : gnome >= 0 ? gnome : text >= 0 ? text : image;
+}

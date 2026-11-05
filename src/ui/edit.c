@@ -46,6 +46,7 @@ void cu_edit_set(CuEdit *e, const char *text) {
     ch_buf_assign(&e->text, text ? text : "");
     e->caret = e->anchor = e->text.len;
     e->scroll_x = e->scroll_y = 0;
+    e->reveal_caret = true;
     ch_vec_clear(&e->undo);
     ch_vec_init(&e->undo, snapshot_free);
     invalidate_layout(e);
@@ -124,6 +125,7 @@ void cu_edit_insert(CuEdit *e, const char *text) {
     push_undo(e, UNDO_OTHER);
     delete_selection(e);
     insert_raw(e, text, 0);
+    e->reveal_caret = true;
 }
 static size_t prev_char(const CuEdit *e, size_t o) {
     return (size_t)(ch_utf8_prev(e->text.str, e->text.str + o) - e->text.str);
@@ -191,6 +193,7 @@ void edit_pointer(Cu *cu, CuEdit *e, CuRect rect, float x, float y, bool extend,
     }
     e->blink_start = ch_monotonic_us();
     e->desired_x = -1;
+    e->reveal_caret = true;
 }
 typedef struct {
     Cu *cu;
@@ -208,9 +211,37 @@ static void pasted(const char *text, void *data) {
         delete_selection(p->edit);
         insert_raw(p->edit, text, 0);
         p->edit->blink_start = ch_monotonic_us();
+        p->edit->reveal_caret = true;
         cu->invalid = true;
         cu_invalidate(cu);
     }
+    cu->paste_edit = NULL;
+    free(p);
+}
+static void pasted_data(const char *mime, const void *bytes, size_t size, void *data) {
+    Paste *p = data;
+    Cu *cu = p->cu;
+    bool text = mime && (ch_str_has_prefix(mime, "text/plain") || !strcmp(mime, "UTF8_STRING") || !strcmp(mime, "TEXT") ||
+                         !strcmp(mime, "STRING"));
+    if (text) {
+        char *copy = ch_utf8_make_valid(bytes, (ptrdiff_t)size);
+        pasted(copy, p);
+        free(copy);
+        return;
+    }
+    /* A list of links is ordinary text to paste; only local files are attachments. */
+    bool uris = mime && (!strcmp(mime, "text/uri-list") || !strcmp(mime, "x-special/gnome-copied-files"));
+    if (uris) {
+        char *copy = ch_strndup(bytes, size);
+        bool local = strstr(copy, "file:") != NULL;
+        free(copy);
+        if (!local) {
+            cu->p->clipboard_request(cu->window, pasted, p);
+            return;
+        }
+    }
+    if (mime && size)
+        cu_payload_push(cu, mime, bytes, size, false);
     cu->paste_edit = NULL;
     free(p);
 }
@@ -224,6 +255,7 @@ void edit_handle_input(Cu *cu, El *el, int *flags) {
         bool shift = mods & CU_MOD_SHIFT, ctrl = mods & CU_MOD_CTRL, handled = true;
         size_t before_caret = e->caret, len_before = e->text.len;
         if (key == -1) {
+            cu->sel_focus = false; /* typing goes back to the box */
             push_undo(e, UNDO_TYPE);
             delete_selection(e);
             insert_raw(e, cu->keys[i].text, st->max_length);
@@ -289,10 +321,17 @@ void edit_handle_input(Cu *cu, El *el, int *flags) {
                 insert_raw(e, "\n", st->max_length);
             }
         } else if (ctrl && !shift && key == 'a') {
-            e->anchor = 0;
-            e->caret = e->text.len;
+            /* An empty box, or text just clicked in the transcript: select what can be read. */
+            if (!e->text.len || cu->sel_focus)
+                handled = false;
+            else {
+                e->anchor = 0;
+                e->caret = e->text.len;
+            }
         } else if (ctrl && (key == 'c' || key == 'x' || key == CU_KEY_INSERT) && !shift) {
-            if (e->caret == e->anchor || e->password)
+            if (key != 'x' && cu->sel_focus)
+                handled = false;
+            else if (e->caret == e->anchor || e->password)
                 handled = key == 'x';
             else {
                 size_t a = CH_MIN(e->caret, e->anchor), b = CH_MAX(e->caret, e->anchor);
@@ -309,7 +348,10 @@ void edit_handle_input(Cu *cu, El *el, int *flags) {
                 Paste *p = ch_new0(Paste, 1);
                 *p = (Paste){cu, e, cu->focus};
                 cu->paste_edit = e;
-                cu->p->clipboard_request(cu->window, pasted, p);
+                if (st->accept_data && cu->p->clipboard_request_data)
+                    cu->p->clipboard_request_data(cu->window, pasted_data, p);
+                else
+                    cu->p->clipboard_request(cu->window, pasted, p);
             }
         } else if (ctrl && !shift && key == 'z') {
             if (e->undo.len) {
@@ -324,6 +366,7 @@ void edit_handle_input(Cu *cu, El *el, int *flags) {
             handled = false;
         if (handled) {
             cu->keys[i].consumed = true;
+            e->reveal_caret = true;
             e->blink_start = ch_monotonic_us();
             if (e->text.len != len_before || key == 'z')
                 *flags |= CU_EDIT_CHANGED;
@@ -361,11 +404,12 @@ void edit_paint(Cu *cu, CuCanvas *c, El *el) {
     /* Keep the caret in view. */
     if (e->multiline) {
         float max = fmaxf(0, l->h - r.h);
-        if (focused) {
+        if (focused && e->reveal_caret) {
             if (cy < e->scroll_y)
                 e->scroll_y = cy;
             if (cy + ch > e->scroll_y + r.h)
                 e->scroll_y = cy + ch - r.h;
+            e->reveal_caret = false;
         }
         e->scroll_y = CH_CLAMP(e->scroll_y, 0, max);
         e->scroll_x = 0;

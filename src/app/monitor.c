@@ -95,112 +95,109 @@ void monitor_finish(App *a, const ChError *error) {
     a->health_pending = false;
     free(a->last_request_error);
     a->last_request_error = error ? ch_strdup(error->message) : NULL;
-    const char *phase = error ? ch_error_is(error, CH_ERR_CANCELLED) ? "Stopped" : "Request failed · open Diagnostics"
-                      : !strcmp(ch_json_str(a->metrics, "finish_reason"), "length") ? "Output limit reached"
-                                                                                    : "Completed";
-    app_set_status(a, phase);
+    /* The transcript now shows the outcome: the numbers under the reply, or the stopped note. */
+    a->status_visible = false;
+    a->request_started_us = 0;
+    a->status_until = 0;
 }
+/* A passing note, such as a file that could not be attached. */
+static void note_build(App *a) {
+    Cu *cu = a->cu;
+    int64_t now = ch_monotonic_us();
+    if (a->status_until && now >= a->status_until) {
+        a->status_visible = false;
+        a->status_until = 0;
+        return;
+    }
+    cu_open(cu, cu_id(cu, "monitor"), &(CuBox){.row = true, .w = CU_GROW, .gap = 8, .align_y = CU_CENTER, CU_PAD2(2, 10)});
+    cu_text(cu, cu_id(cu, "monitor-status"), a->status ? a->status : "",
+            &(CuTextStyle){.font = ui_font(a, 12, 400), .color = C_MUTED, .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
+    if (ui_icon_button_sized(a, cu_id(cu, "monitor-dismiss"), "window-close", 13, 2, "Dismiss", true, false)) {
+        a->status_visible = false;
+        a->status_until = 0;
+    }
+    cu_close(cu);
+    if (a->status_until)
+        cu_animate(cu, 500);
+}
+/* What the running request is doing. It appears only while one runs. */
 void monitor_build(App *a) {
     Cu *cu = a->cu;
+    if (a->worktree_pending || a->worktree_removing) {
+        cu_open(cu, cu_id(cu, "monitor"), &(CuBox){.row = true, .w = CU_GROW, .gap = 8, .align_y = CU_CENTER, CU_PAD2(2, 10)});
+        ui_spinner(a, 13);
+        ui_label(a, a->worktree_removing ? "Removing worktree…" : ch_cancel_is_cancelled(a->cancel) ? "Stopping…" : "Creating worktree…",
+                 12, 0xffd8d8d8);
+        cu_close(cu);
+        return;
+    }
     if (!a->status_visible)
         return;
+    if (!a->busy) {
+        note_build(a);
+        return;
+    }
     int64_t now = ch_monotonic_us();
-    bool request = a->request_started_us != 0;
-    bool failed = request && a->last_request_error && a->request_ended_us;
     ch_mutex_lock(&a->event_mutex);
     int64_t network = a->last_network_us, token = a->last_token_us;
     ch_mutex_unlock(&a->event_mutex);
-    if (a->busy && a->config.provider != 5 && !a->health_pending && now - a->last_health_poll >= 3000000 &&
-        !a->approval_dialog)
+    if (a->config.provider != 5 && !a->health_pending && now - a->last_health_poll >= 3000000 && !a->approval_dialog)
         monitor_probe(a);
-    const char *phase = request ? (a->run_phase ? a->run_phase : "Working…") : a->status ? a->status : "";
+    const char *phase = a->run_phase ? a->run_phase : "Working…";
     const char *kind = ch_json_str(a->metrics, "phase");
     bool model_wait = !*kind || !strcmp(kind, "waiting") || !strcmp(kind, "prefill");
-    if (a->busy && model_wait && !ch_strcmp0(a->health_state, "Model loading"))
+    bool loading = model_wait && !ch_strcmp0(a->health_state, "Model loading") && a->load_started_us && !token;
+    if (loading)
         phase = "Loading model…";
-    if (a->busy && !strcmp(kind, "prefill"))
+    if (!strcmp(kind, "prefill"))
         phase = "Processing prompt…";
-    if (a->busy && !ch_strcmp0(a->health_state, "Model load failed"))
+    if (!ch_strcmp0(a->health_state, "Model load failed"))
         phase = "Model load failed · open Diagnostics";
-    if (a->busy && ch_cancel_is_cancelled(a->cancel))
+    if (ch_cancel_is_cancelled(a->cancel))
         phase = "Stopping…";
-    cu_open(cu, cu_id(cu, "monitor"), &(CuBox){.w = CU_GROW, .bg = 0xff232323, .border = 1,
-                                               .border_color = failed && !ch_strcmp0(phase, "Request failed · open Diagnostics") ? 0xffba705c : 0xff3a3a3a,
-                                               .radius = 9, CU_PAD2(7, 10), .gap = 5});
+    cu_open(cu, cu_id(cu, "monitor"), &(CuBox){.w = CU_GROW, CU_PAD2(2, 10), .gap = 4});
     cu_open(cu, 0, &(CuBox){.row = true, .gap = 8, .align_y = CU_CENTER, .w = CU_GROW});
-    if (a->busy)
-        ui_spinner(a, 14);
-    bool error_phase = failed && strcmp(phase, "Stopped");
+    ui_spinner(a, 13);
     cu_open(cu, cu_id(cu, "monitor-status"), &(CuBox){.w = CU_GROW, .tooltip = a->last_request_error ? a->last_request_error : phase});
-    cu_text(cu, 0, phase, &(CuTextStyle){.font = ui_font(a, 12, 400), .color = error_phase ? 0xffefa68e : 0xffe1e1e1,
-                                         .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
+    cu_text(cu, 0, phase, &(CuTextStyle){.font = ui_font(a, 12, 400), .color = 0xffd8d8d8, .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
     cu_close(cu);
-    if (request) {
-        int64_t elapsed = ((a->request_ended_us ? a->request_ended_us : now) - a->request_started_us) / CH_USEC_PER_SEC;
-        char clock[32];
-        snprintf(clock, sizeof(clock), "%lld:%02lld", (long long)(elapsed / 60), (long long)(elapsed % 60));
-        ui_label(a, clock, 11, 0xffaaaaaa);
-        if (a->busy)
-            cu_animate(cu, 250);
+    /* Tokens per second once they arrive; a request that has not produced any shows why. */
+    double total = json_object_get_double(ch_json_get(a->metrics, "prompt_total"));
+    double processed = json_object_get_double(ch_json_get(a->metrics, "prompt_processed"));
+    ChBuf detail;
+    ch_buf_init(&detail);
+    if (a->metrics && json_object_get_int64(ch_json_get(a->metrics, "output_tokens")) > 0) {
+        char *summary = ch_stats_summary(a->metrics);
+        ch_buf_append(&detail, summary);
+        free(summary);
+    } else if (total > 0)
+        ch_buf_printf(&detail, "Prompt %.0f / %.0f tokens", processed, total);
+    if (!a->approval_dialog && !ch_str_has_prefix(phase, "Using") && !ch_str_has_prefix(phase, "Tool")) {
+        int64_t silence = (now - (token ? token : network ? network : a->request_started_us)) / CH_USEC_PER_SEC;
+        if (silence >= 15) {
+            ch_buf_printf(&detail, "%sNo %s for %llds", detail.len ? " · " : "", token ? "new tokens" : "response data", (long long)silence);
+            char *slot = model_slot_text(a, token != 0);
+            if (slot)
+                ch_buf_printf(&detail, " · %s", slot);
+            free(slot);
+        }
     }
-    if (ui_flat_button(a, cu_id(cu, "monitor-diagnostics"), NULL, "Diagnostics", NULL, 11, C_TEXT,
-                       "Server status, device and recent logs (Ctrl+Shift+D)", true, 0))
-        open_diagnostics(a);
-    if (!a->busy && ui_icon_button_sized(a, cu_id(cu, "monitor-dismiss"), "window-close", 13, 2, "Dismiss", true, false))
-        a->status_visible = false;
-    cu_close(cu);
-    if (request) {
-        double total = json_object_get_double(ch_json_get(a->metrics, "prompt_total"));
-        double processed = json_object_get_double(ch_json_get(a->metrics, "prompt_processed"));
-        ChBuf detail;
-        ch_buf_init(&detail);
-        /* "0 output tokens · speed not reported" says nothing while the prompt is still being read. */
-        if (a->metrics && (json_object_get_int64(ch_json_get(a->metrics, "output_tokens")) > 0 || !a->busy)) {
-            char *summary = ch_stats_summary(a->metrics);
-            ch_buf_append(&detail, summary);
-            free(summary);
-        } else if (a->busy && total > 0)
-            ch_buf_printf(&detail, "Prompt %.0f / %.0f tokens · waiting for the first token", processed, total);
-        else
-            ch_buf_append(&detail, a->config.provider == 5 ? "Token speed is not reported by this harness" : "Waiting for token counts and speed");
-        /* Prompt progress or tokens show the model is running, whatever the last status check said. */
-        bool running = token || !strcmp(kind, "prefill") || !strcmp(kind, "generating");
-        if (a->busy && a->health_state && !(running && !strcmp(a->health_state, "Model loading")))
-            ch_buf_printf(&detail, " · %s", a->health_state);
-        if (a->busy && !ch_strcmp0(a->health_state, "Model loading") && a->load_started_us) {
-            char *eta = model_eta_text(a, NULL);
-            ch_buf_printf(&detail, " · %s", eta);
-            free(eta);
-        }
-        json_object *device = model_device(a);
-        if (*model_backend(a)) {
-            json_object *used = ch_json_get(device, "actual_devices");
-            const char *name = used && json_object_is_type(used, json_type_array) && json_object_array_length(used)
-                                   ? ch_json_str(json_object_array_get_idx(used, 0), "name") : "";
-            ch_buf_printf(&detail, " · on %s%s%s%s", model_backend(a), *name ? " (" : "", name, *name ? ")" : "");
-        }
-        char *busy = a->busy ? model_live_text(a, true) : NULL;
-        if (busy)
-            ch_buf_printf(&detail, " · %s", busy);
-        free(busy);
-        if (a->busy && !a->approval_dialog && !ch_str_has_prefix(phase, "Using") && !ch_str_has_prefix(phase, "Tool")) {
-            int64_t silence = (now - (token ? token : network ? network : a->request_started_us)) / CH_USEC_PER_SEC;
-            if (silence >= 15) {
-                ch_buf_printf(&detail, " · No %s for %llds", token ? "new tokens" : "response data", (long long)silence);
-                char *slot = model_slot_text(a, token != 0);
-                if (slot)
-                    ch_buf_printf(&detail, " · %s", slot);
-                free(slot);
-            }
-        }
-        cu_open(cu, cu_id(cu, "monitor-metrics"), &(CuBox){.w = CU_GROW, .tooltip = cu_frame_printf(cu, "%s", detail.str)});
-        cu_text(cu, 0, detail.str, &(CuTextStyle){.font = ui_font(a, 11, 400), .color = 0xffaaaaaa, .ellipsize = CU_ELLIPSIZE_END, .w = CU_GROW});
+    if (detail.len) {
+        cu_open(cu, cu_id(cu, "monitor-metrics"), &(CuBox){.w = CU_FIT_MAX(380), .tooltip = cu_frame_printf(cu, "%s", detail.str)});
+        cu_text(cu, 0, detail.str, &(CuTextStyle){.font = ui_font(a, 11, 400), .color = 0xffaaaaaa, .ellipsize = CU_ELLIPSIZE_END, .w = CU_FIT_MAX(380)});
         cu_close(cu);
-        ch_buf_clear(&detail);
-        bool prefill = a->busy && !strcmp(kind, "prefill");
-        if (a->busy && (prefill || !token))
-            ui_progress(a, cu_id(cu, "monitor-progress"), prefill && total > 0 ? CH_CLAMP(processed / total, 0, 1) : -1, 0);
     }
+    ch_buf_clear(&detail);
+    int64_t elapsed = (now - a->request_started_us) / CH_USEC_PER_SEC;
+    char clock[32];
+    snprintf(clock, sizeof(clock), "%lld:%02lld", (long long)(elapsed / 60), (long long)(elapsed % 60));
+    ui_label(a, clock, 11, 0xffaaaaaa);
+    cu_animate(cu, 250);
+    cu_close(cu);
+    if (loading)
+        model_progress_build(a);
+    else if (!strcmp(kind, "prefill") && total > 0)
+        ui_progress(a, cu_id(cu, "monitor-progress"), CH_CLAMP(processed / total, 0, 1), 0);
     cu_close(cu);
 }
 char *diagnostics_snapshot(App *a) {
@@ -228,7 +225,7 @@ char *diagnostics_snapshot(App *a) {
     free(slot);
     json_object *device = model_device(a);
     ch_buf_printf(&s, "Model state: %s%s\n", model_state_name(a->model_state ? a->model_state : ""),
-                  a->keep_loaded ? " · keep loaded on" : " · keep loaded off");
+                  a->preload ? " · pre-load on" : " · pre-load off");
     if (a->last_load_seconds > 0)
         ch_buf_printf(&s, "Last load time: %.1fs\n", a->last_load_seconds);
     if (device)

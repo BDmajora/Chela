@@ -38,6 +38,7 @@ TextLayout *text_layout_new(Cu *cu, const CuSpan *spans, int count, const TextOp
 void text_layout_free(TextLayout *layout);
 float text_natural_width(Cu *cu, const CuSpan *spans, int count, const TextOptions *options);
 size_t text_layout_hit(Cu *cu, const TextLayout *layout, float x, float y);
+const char *text_layout_link(Cu *cu, const TextLayout *layout, float x, float y);
 void text_layout_caret(Cu *cu, const TextLayout *layout, size_t offset, float *x, float *y, float *h);
 void text_layout_paint(Cu *cu, CuCanvas *c, const TextLayout *layout, float x, float y, size_t sel_a, size_t sel_b,
                        CuColor selection);
@@ -58,7 +59,7 @@ struct El {
     int span_count;
     TextOptions text;
     CuTextStyle text_style;
-    bool selectable;
+    bool selectable, tight;
     const char *icon;
     float icon_size;
     CuColor color;
@@ -73,6 +74,8 @@ struct El {
     TextLayout *layout;
     int layer;
     bool has_grow_w, has_grow_h;
+    int sel_index; /* 1 + position among this frame's selectable text; 0 when not selectable */
+    CuId scroller; /* the scrolling box this selectable text sits in */
 };
 typedef struct {
     CuId id;
@@ -88,6 +91,13 @@ typedef struct {
     CuCursor cursor;
     const char *tooltip;
 } Hit;
+/* Selectable text in reading order. A selection stays within one group: the same
+ * layer and the same scrolling box. */
+typedef struct {
+    CuId id, scroller;
+    int layer;
+    bool tight;
+} Selectable;
 typedef struct {
     CuId id;
     int64_t frame;
@@ -135,6 +145,7 @@ struct Cu {
     CuId hot, pressed, clicked[8], right_clicked, double_clicked, last_click;
     int click_count;
     int64_t last_click_time;
+    float last_click_x, last_click_y;
     CuId focus, focus_next;
     bool focus_visible;
     int tab_dir;
@@ -151,19 +162,31 @@ struct Cu {
     CuId scrolled[8];
     int scrolled_count;
     /* drags */
-    CuId drag_edit, drag_sel, drag_scrollbar;
+    CuId drag_edit, drag_scrollbar;
+    bool drag_sel;
     float drag_offset;
-    /* selection in read-only text */
-    CuId sel_id;
+    /* selection in read-only text, which may span many elements */
+    CuId sel_anchor_id, sel_caret_id, sel_scroller;
+    int sel_layer;
     size_t sel_anchor, sel_caret;
+    int sel_first, sel_last;       /* positions in selectables, -1 when nothing is selected */
+    size_t sel_start, sel_end;     /* offsets in those two elements */
+    bool sel_focus;                /* the last press was on read-only text, so Ctrl+A and Ctrl+C mean it */
+    Selectable *selectables;
+    int selectable_count, selectable_cap;
     char *sel_text;
     /* tooltip */
     CuId tip_id, tip_suppressed;
     int64_t tip_since;
     char *tip_text;
-    /* paste */
+    /* paste and drop */
     CuEdit *paste_edit;
     CuId paste_focus;
+    ChVec payloads;
+    bool drag_over;
+    /* links */
+    char *link_clicked;
+    CuId link_press;
     /* focus order this frame */
     CuId focusables[256];
     int focusable_layer[256];
@@ -175,6 +198,9 @@ struct Cu {
     int64_t wake_at;
     unsigned timer;
     CuCursor cursor;
+    /* Layouts replaced since the frame began. Elements may still point at them, so
+     * they outlive the frame's tree, even if two elements ever share an id. */
+    ChVec retired;
     /* caches */
     struct FontEntry {
         CuFontDesc desc;
@@ -192,6 +218,7 @@ struct Cu {
     CuCanvas *canvas;
     float alpha;
 };
+void cu_payload_push(Cu *cu, const char *mime, const void *data, size_t size, bool dropped);
 void *cu_arena(Cu *cu, size_t size);
 char *cu_arena_strndup(Cu *cu, const char *s, size_t n);
 State *cu_state(Cu *cu, CuId id);

@@ -46,7 +46,8 @@ class Desktop:
             f"[sidebar]\ngroup=none\n[voice]\ndictation_command={sys.executable} {transcription}\n")
         self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(temp), "LANG": "C.UTF-8",
                     "XDG_CONFIG_HOME": str(temp / "config"), "XDG_DATA_HOME": str(temp / "data"),
-                    "XDG_RUNTIME_DIR": str(temp)}
+                    "XDG_RUNTIME_DIR": str(temp),
+                    **{k: v for k, v in os.environ.items() if k.endswith("SAN_OPTIONS")}}
         self.phase = 0
 
     def run(self, name, script):
@@ -110,7 +111,8 @@ def main():
             geometry = {}
             for capture in ["ui-welcome.png", "ui-conversation.png", "ui-chat-rich-narrow.png", "ui-narrow.png",
                             "ui-sidebar-hidden.png"]:
-                geometry[capture] = measure_frame(BUILD / capture, executable, sidebar=capture != "ui-sidebar-hidden.png")
+                geometry[capture] = measure_frame(BUILD / capture, executable, sidebar=capture != "ui-sidebar-hidden.png",
+                                                  panel=262 if capture == "ui-conversation.png" else 0)
             (BUILD / "visual-geometry.json").write_text(json.dumps(geometry, indent=2) + "\n")
     finally:
         server.shutdown()
@@ -124,12 +126,13 @@ def tour(d):
     """Welcome screens, every composer menu and nested submenus, window sizes."""
     gets = Handler.gets
     d.run("tour", """
-        expect Let’s build something.
+        expect Open folder…
         shot ui-welcome.png
         key ctrl+m
         expect Bypass permissions
         shot ui-menu-permissions.png
         key home
+        key down
         key down
         key return
         expect-not Bypass permissions
@@ -137,24 +140,62 @@ def tour(d):
         key ctrl+m
         key home
         key return
+        expect Auto
+        expect-not Manual
+        key ctrl+m
+        key home
+        key down
+        key return
         expect Manual
+        key ctrl+shift+l
+        expect Effort
+        expect-not Pre-load model
+        expect-not Test selected model
+        expect-not Server diagnostics
+        expect-not Model settings
+        shot ui-menu-model.png
+        key end
+        key left
+        expect Balanced
+        shot ui-menu-effort.png
+        key right
+        expect-not Balanced
+        key return
+        expect Balanced
+        key down
+        key down
+        key return
+        expect-not Balanced
+        expect Quick
+        key ctrl+shift+l
+        expect Effort
+        key end
+        key left
+        key return
+        expect-not Quick
+        key ctrl+shift+l
+        until tool
+        hover Effort
+        expect Balanced
+        hover tool
+        expect Balanced
+        hover stream
+        expect-not Balanced
+        key escape
         key ctrl+shift+a
         expect Add files or photos
         shot ui-menu-attach.png
         key home
         key down
+        key down
         key right
         expect review-style
         shot ui-menu-skills.png
         key left
-        key down
-        key right
-        shot ui-menu-connectors.png
-        key escape
         key escape
         expect-not Add files or photos
         key ctrl+shift+v
-        shot ui-menu-voice.png
+        shot ui-voice-settings.png
         key escape
         key ctrl+shift+p
         shot ui-menu-projects.png
@@ -201,13 +242,15 @@ def conversation(d):
         key ctrl+m
         key home
         key down
+        key down
         key return
         type test request
         key return
-        until Completed
+        until Reply
         expect Hello 🦀
         key ctrl+m
         key home
+        key down
         key return
         shot ui-conversation.png
         key return
@@ -217,7 +260,7 @@ def conversation(d):
         key ctrl+d
         until second request
         key return
-        until Completed
+        until Reply
         expect Hello 🦀
         key ctrl+n
         idle
@@ -255,6 +298,12 @@ def sidebar(d):
         key return
         until-not Rename session
         expect test request renamed
+        tap More
+        tap Group and sort
+        expect Group by
+        key escape
+        key escape
+        expect-not Keyboard shortcuts
         key ctrl+shift+f
         shot ui-code-organizer.png
         key end
@@ -299,7 +348,7 @@ def sidebar(d):
         expect test request renamed
         type follow-up
         key return
-        until Completed
+        until Reply
     """)
     prefs = d.preferences()
     assert "group=project" in prefs and "sort_titles=true" in prefs, prefs
@@ -332,12 +381,12 @@ def settings(d):
         expect Appearance
         shot ui-settings-general.png
         key ctrl+f
-        type code
+        type model
         idle
         shot ui-settings-search.png
         key ctrl+3
         idle
-        shot ui-settings-code.png
+        shot ui-settings-models.png
         key ctrl+1
         tap Narrow
         tap Medium
@@ -349,11 +398,12 @@ def settings(d):
         key ctrl+shift+a
         key home
         key down
+        key down
         key right
         tap review-style
         type review this
         key return
-        until Completed
+        until Reply
         key ctrl+1
         type visual review conversation
         key return
@@ -401,7 +451,7 @@ def tools(d):
         shot ui-approval.png
         tap Allow once
         until-not Allow once
-        until Completed
+        until Reply
     """)
     chat = next(r for r in Handler.requests if last(r["messages"], "user") == "inspect this project")
     assert {t["function"]["name"] for t in chat["tools"]} == {"list_files", "read_file"}
@@ -418,15 +468,15 @@ def recovery(d):
         type unsent draft
         tap Retry message
         until-not Retry message
-        until Completed
+        until Hello 🦀
         tap unsent draft
         key return
-        until Completed
+        until Reply
         type slow request
         key return
         wait 300
         key escape
-        until Stopped
+        until Reply
         shot ui-final.png
         key ctrl+q
     """)
@@ -450,7 +500,7 @@ def restart(d):
         until Read workspace file contents
         type inspect this project after restart
         key return
-        until Completed
+        until Reply
     """)
     assert len(d.sessions()) == count
     assert len(Handler.requests[-1]["tools"]) == 2, "A restored Chat session keeps read-only tools"
